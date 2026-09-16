@@ -166,12 +166,44 @@ if HAS_LINE:
     pending_images = {}  # user_id -> image_url
     pending_posts = {}   # user_id -> {text, image_url, schedule}
 
+    def gemini_expand(short_text):
+        """ใช้ Gemini ฟรีขยายไอเดียสั้นๆ เป็นแคปชันยาว"""
+        import requests
+        key = os.environ.get("GEMINI_API_KEY", "")
+        if not key:
+            return ""
+        prompt = f"""ขยายไอเดียสั้นๆ "{short_text}" เป็นแคปชัน Facebook สำหรับเพจ "ก๊อดเองแม่ตั้งให้" (ความบันเทิง/เรื่องทั่วไป)
+โทน: สนุก เป็นกันเอง ชวนคอมเมนต์ ใส่อีโมจิ 1-2 ตัว ใส่แฮชแท็ก 3-5 อัน (#ก๊อดเองแม่ตั้งให้ ต้องมี) ภาษาไทย สั้นกระชับ ไม่เกิน 5 บรรทัด"""
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key={key}"
+            r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}, timeout=20)
+            if r.status_code == 200:
+                j = r.json()
+                txt = j["candidates"][0]["content"]["parts"][0]["text"]
+                return txt.strip()
+        except Exception as e:
+            print(f"gemini error: {e}")
+        return ""
+
+    def gemini_image(prompt_text):
+        """สร้างรูป AI ด้วย Pollinations (ฟรี ไม่ต้องใช้ Gemini Image)"""
+        try:
+            import urllib.parse
+            # ใช้ Pollinations ฟรี
+            q = urllib.parse.quote(prompt_text[:150])
+            return f"https://image.pollinations.ai/prompt/{q}?width=1024&height=1024&nologo=true"
+        except:
+            return ""
+
     def improve_caption(text):
-        """ช่วยเกลาแคปชันแบบง่าย ไม่ใช้ LLM (ฟรี)"""
+        """ช่วยเกลาแคปชัน - ลองใช้ Gemini ก่อน ถ้าไม่ได้ใช้แบบง่าย"""
+        expanded = gemini_expand(text)
+        if expanded and len(expanded) > 20:
+            return expanded
+        # fallback แบบง่าย
         if "#ก๊อดเองแม่ตั้งให้" not in text:
             text += "\n\n#ก๊อดเองแม่ตั้งให้ #เรื่องทั่วไป"
-        # เติมอีโมจิถ้าไม่มี
-        if not any(c in text for c in ["�", "🔴", "✨", "🏟️"]):
+        if not any(c in text for c in ["✨", "🔴", "🏟️", "😅", "❤️"]):
             text = "✨ " + text
         return text
 
@@ -211,14 +243,30 @@ if HAS_LINE:
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
             return
 
-        # 2. ถ้าพิมพ์ "ช่วยเกลา" / "ช่วยคิด" -> ปรับแคปชันที่รออยู่
+        # 2. ถ้าพิมพ์ "ช่วยเกลา" / "ช่วยคิด" -> ปรับแคปชันที่รออยู่ด้วย Gemini
         if any(k in text for k in ["ช่วยเกลา", "ช่วยคิด", "อยากให้ช่วย"]) and uid in pending_posts:
             pending = pending_posts[uid]
-            pending["text"] = improve_caption(pending["text"])
-            preview = pending["text"][:300]
+            # ถ้าข้อความสั้นมาก ให้ Gemini ขยาย
+            expanded = gemini_expand(pending["text"])
+            if expanded:
+                pending["text"] = expanded
+            else:
+                pending["text"] = improve_caption(pending["text"])
+            preview = pending["text"][:400]
             img_note = "📸 มีรูป" if pending["image_url"] else "📝 ไม่มีรูป"
             sched_note = f"⏰ ตั้งเวลา {pending['schedule'].strftime('%d/%m %H:%M')}" if pending["schedule"] else "⚡ โพสต์ทันที"
-            reply = f"✨ เกลาแคปชันให้แล้ว:\n---\n{preview}\n---\n{img_note} | {sched_note}\n\nพิมพ์ 'ใช่' เพื่อยืนยันโพสต์ หรือ 'แก้ไข...' เพื่อแก้"
+            reply = f"✨ Gemini ช่วยคิดให้แล้ว:\n---\n{preview}\n---\n{img_note} | {sched_note}\n\nพิมพ์ 'ใช่' เพื่อยืนยันโพสต์ หรือ 'แก้ไข...' เพื่อแก้"
+            line_api.reply_message(event.reply_token, TextMessage(text=reply))
+            return
+
+        # 2.1 ถ้าพิมพ์ "สร้างรูป" / "2" -> สร้างรูป AI
+        if text.strip() in ["2", "2.", "สร้างรูป", "ให้ AI สร้างรูป", "สร้างรูปด้วย"] and uid in pending_posts:
+            pending = pending_posts[uid]
+            prompt = pending["text"][:100] if pending["text"] else "football stadium"
+            img_url = gemini_image(prompt)
+            pending["image_url"] = img_url
+            pending_images.pop(uid, None)
+            reply = f"🎨 สร้างรูป AI แล้ว:\n{img_url}\n\n📋 Preview:\n{pending['text'][:300]}\n\nพิมพ์ 'ใช่' เพื่อยืนยันโพสต์พร้อมรูปนี้"
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
             return
 
