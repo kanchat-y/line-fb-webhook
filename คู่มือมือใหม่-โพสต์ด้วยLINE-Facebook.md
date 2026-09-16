@@ -1,6 +1,20 @@
 # คู่มือมือใหม่ 0 → โพสต์ได้จริงด้วย LINE → Facebook
 ### สำหรับคนไม่เคยทำมาก่อน ทำตามได้ทีละขั้น
 
+> 📥 **ไฟล์ Setup กดรันได้เลย (ไม่ต้องพิมพ์เอง):**
+> - **Local (OpenClaw Local):** [`setup-openclaw-local.ps1`](setup-openclaw-local.ps1) → คลิกขวา `Run with PowerShell` → ทำตามข้อ 2.2-2.3 อัตโนมัติ
+> - **Cloud (GitHub Cloud):** [`setup-github-cloud.ps1`](setup-github-cloud.ps1) → คลิกขวา `Run with PowerShell` → ทำตามข้อ 3.1 อัตโนมัติ
+> - ไฟล์ทั้ง 2 อยู่ใน `https://github.com/kanchat-y/line-fb-webhook` โหลดแล้วรันได้เลย
+
+### ดาวน์โหลดไฟล์ Setup
+```powershell
+# วิธีโหลดเร็ว:
+git clone https://github.com/kanchat-y/line-fb-webhook.git
+# หรือโหลดไฟล์เดี่ยว:
+# https://raw.githubusercontent.com/kanchat-y/line-fb-webhook/main/setup-openclaw-local.ps1
+# https://raw.githubusercontent.com/kanchat-y/line-fb-webhook/main/setup-github-cloud.ps1
+```
+
 **เป้าหมาย:** ส่งไอเดีย+รูปทาง LINE แล้วโพสต์ลง Facebook Page อัตโนมัติ (ทันทีหรือตั้งเวลา) แบบที่เพจ `ก๊อดเองแม่ตั้งให้ (104158371681569)` ทำสำเร็จแล้ว
 
 **มี 2 แบบให้เลือก:**
