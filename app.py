@@ -31,8 +31,27 @@ except ImportError:
     HAS_LINE = False
     print("pip install flask line-bot-sdk")
 
-# โหลด token จาก env หรือ config
-PAGE_ID = "104158371681569"  # ล็อกเพจเดียว
+# รองรับหลายเพจ - อ่านจาก config.json + fallback env
+# เพจ 104158371681569 (ก๊อดเองแม่ตั้งให้) = token หลัก META_ACCESS_TOKEN (verified 3 เพจ)
+# เพจ 788732444316483 (GETUP DEAL) = ต้องใช้ META_ACCESS_TOKEN_GETUPDEAL จาก admin ของเพจนั้น
+def _load_pages_from_config():
+    try:
+        cfg = json.loads(Path(CONFIG).read_text(encoding="utf-8")) if Path(CONFIG).exists() else {}
+        pages_list = cfg.get("platforms", {}).get("facebook", {}).get("pages", [])
+        if pages_list:
+            out = {}
+            for p in pages_list:
+                out[p["id"]] = {"name": p["name"], "page_token": "", "user_token_env": p.get("token_env", "META_ACCESS_TOKEN")}
+            return out
+    except: pass
+    return None
+
+PAGES = _load_pages_from_config() or {
+    "104158371681569": {"name": "ก๊อดเองแม่ตั้งให้", "page_token": "", "user_token_env": "META_ACCESS_TOKEN"},
+    "788732444316483": {"name": "GETUP DEAL", "page_token": "", "user_token_env": "META_ACCESS_TOKEN_GETUPDEAL"}
+}
+# ถ้ามี hardcoded page_token เก่าให้ล้างออก - ให้ใช้ env แทน (ปลอดภัยกว่า)
+PAGE_ID = "104158371681569"  # ค่าเริ่มต้น
 
 def load_json(p, default):
     return json.loads(Path(p).read_text(encoding="utf-8")) if Path(p).exists() else default
@@ -64,7 +83,7 @@ def parse_schedule(text):
         return (now + datetime.timedelta(days=1)).replace(hour=9, minute=0, second=0)
     return None
 
-def create_draft(text, image_url=None, schedule=None):
+def create_draft(text, image_url=None, schedule=None, page_id=None):
     """สร้าง draft ลง calendar.json"""
     cal = load_json(CALENDAR, [])
     new_id = f"post-{len(cal)+1:03d}"
@@ -85,32 +104,34 @@ def create_draft(text, image_url=None, schedule=None):
         "media_url": image_url or "",
         "created_at": datetime.now(bkk).isoformat(),
         "source": "LINE",
-        "page_id": PAGE_ID
+        "page_id": page_id or PAGE_ID
     }
     cal.append(post)
     Path(CALENDAR).write_text(json.dumps(cal, ensure_ascii=False, indent=2), encoding="utf-8")
     return post
 
-def post_to_facebook(text, image_url=None, schedule=None):
-    """โพสต์จริงผ่าน Graph API - รองรับทั้ง URL และไฟล์ local"""
+def post_to_facebook(text, image_url=None, schedule=None, page_id=None):
+    """โพสต์จริงผ่าน Graph API - รองรับทั้ง URL และไฟล์ local และหลายเพจ"""
     import urllib.request, urllib.parse
-    user_token = os.environ.get("META_ACCESS_TOKEN", "")
-    if not user_token:
-        return {"error": "META_ACCESS_TOKEN not set"}
-    try:
-        r = json.loads(urllib.request.urlopen(f"https://graph.facebook.com/v23.0/me/accounts?fields=id,access_token&access_token={user_token}").read().decode())
-        pt = next(p["access_token"] for p in r["data"] if p["id"] == PAGE_ID)
-    except Exception as e:
-        return {"error": str(e)}
-
+    target_page = page_id or PAGE_ID
+    page_cfg = PAGES.get(target_page, {})
+    # ลองใช้ page_token ที่เก็บไว้ก่อน (สำหรับ GETUP DEAL)
+    pt = page_cfg.get("page_token")
+    if not pt:
+        user_token = os.environ.get(page_cfg.get("user_token_env", "META_ACCESS_TOKEN"), "") or os.environ.get("META_ACCESS_TOKEN", "")
+        if not user_token:
+            return {"error": "META_ACCESS_TOKEN not set"}
+        try:
+            r = json.loads(urllib.request.urlopen(f"https://graph.facebook.com/v23.0/me/accounts?fields=id,access_token&access_token={user_token}").read().decode())
+            pt = next(p["access_token"] for p in r["data"] if p["id"] == target_page)
+        except Exception as e:
+            return {"error": str(e)}
     # ถ้า image_url เป็นไฟล์ local ให้อัปโหลดแบบไฟล์ตรง (ไม่ผ่าน URL)
     is_local_file = image_url and Path(image_url).exists()
     if is_local_file and not image_url.startswith("http"):
-        # local file path เช่น autopost/media/xxx.jpg
         image_url = str(Path(image_url).resolve())
 
     if is_local_file:
-        # อัปโหลดไฟล์ตรง
         import requests
         try:
             with open(image_url, "rb") as f:
@@ -119,7 +140,7 @@ def post_to_facebook(text, image_url=None, schedule=None):
                 if schedule:
                     data["published"] = "false"
                     data["scheduled_publish_time"] = str(int(schedule.timestamp()))
-                resp = requests.post(f"https://graph.facebook.com/v23.0/{PAGE_ID}/photos", data=data, files=files, timeout=30)
+                resp = requests.post(f"https://graph.facebook.com/v23.0/{target_page}/photos", data=data, files=files, timeout=30)
                 if resp.status_code == 200:
                     return {"success": True, "response": resp.json()}
                 else:
@@ -131,17 +152,17 @@ def post_to_facebook(text, image_url=None, schedule=None):
     if image_url and schedule:
         unix = int(schedule.timestamp())
         data = urllib.parse.urlencode({"url": image_url, "caption": text, "access_token": pt, "published": "false", "scheduled_publish_time": unix}).encode()
-        endpoint = f"https://graph.facebook.com/v23.0/{PAGE_ID}/photos"
+        endpoint = f"https://graph.facebook.com/v23.0/{target_page}/photos"
     elif image_url:
         data = urllib.parse.urlencode({"url": image_url, "caption": text, "access_token": pt}).encode()
-        endpoint = f"https://graph.facebook.com/v23.0/{PAGE_ID}/photos"
+        endpoint = f"https://graph.facebook.com/v23.0/{target_page}/photos"
     elif schedule:
         unix = int(schedule.timestamp())
         data = urllib.parse.urlencode({"message": text, "access_token": pt, "published": "false", "scheduled_publish_time": unix}).encode()
-        endpoint = f"https://graph.facebook.com/v23.0/{PAGE_ID}/feed"
+        endpoint = f"https://graph.facebook.com/v23.0/{target_page}/feed"
     else:
         data = urllib.parse.urlencode({"message": text, "access_token": pt}).encode()
-        endpoint = f"https://graph.facebook.com/v23.0/{PAGE_ID}/feed"
+        endpoint = f"https://graph.facebook.com/v23.0/{target_page}/feed"
 
     try:
         req = urllib.request.Request(endpoint, data=data)
@@ -238,16 +259,49 @@ if HAS_LINE:
         text = event.message.text.strip()
         uid = event.source.user_id
 
-        # 1. ถ้าพิมพ์ "ใช่" / "ยืนยัน" / "โพสต์เลย" -> ยืนยันโพสต์ที่รออยู่
+        # 0. เลือกเพจ (ถ้ารอเลือกเพจอยู่) - บังคับทุกครั้งก่อนโพสต์
+        if uid in pending_posts and pending_posts[uid].get("awaiting_page"):
+            choice = text.strip().lower()
+            if choice in ["1", "1.", "ก๊อด", "ก๊อดเอง", "ก๊อดเองแม่ตั้งให้"]:
+                pending_posts[uid]["page_id"] = "104158371681569"
+                pending_posts[uid].pop("awaiting_page", None)
+                pending_posts[uid]["page_id_selected"] = True
+            elif choice in ["2", "2.", "getup", "getup deal", "getupdeal", "getupdeal "]:
+                pending_posts[uid]["page_id"] = "788732444316483"
+                pending_posts[uid].pop("awaiting_page", None)
+                pending_posts[uid]["page_id_selected"] = True
+            else:
+                line_api.reply_message(event.reply_token, TextMessage(text="❓ เลือกเพจไม่ถูก พิมพ์ 1 สำหรับ ก๊อดเองแม่ตั้งให้ หรือ 2 สำหรับ GETUP DEAL"))
+                return
+            # หลังเลือกเพจแล้ว ถามยืนยัน
+            p = pending_posts[uid]
+            pg_name = PAGES.get(p["page_id"], {}).get("name", p["page_id"])
+            preview = p["text"][:350] if p["text"] else "(ไม่มีข้อความ)"
+            img_note = "📸 มีรูป" if p["image_url"] else "📝 ไม่มีรูป"
+            sched_note = f"⏰ ตั้งเวลา {p['schedule'].strftime('%d/%m %H:%M')}" if p["schedule"] else "⚡ โพสต์ทันที"
+            reply = f"✅ เลือกเพจ: {pg_name}\n📋 Preview:\n---\n{preview}\n---\n{img_note} | {sched_note}\n\nพิมพ์ 'ใช่' เพื่อยืนยันโพสต์ หรือ 'ช่วยเกลา' ให้ช่วยคิด"
+            line_api.reply_message(event.reply_token, TextMessage(text=reply))
+            return
+
+        # 1. ถ้าพิมพ์ "ใช่" / "ยืนยัน" / "โพสต์เลย" -> ต้องเลือกเพจก่อนโพสต์เสมอ
         if text in ["ใช่", "ใช่ครับ", "ยืนยัน", "โพสต์เลย", "ตกลง"] and uid in pending_posts:
+            # บังคับถามเลือกเพจทุกครั้ง (ตามคำขอ)
+            if not pending_posts[uid].get("awaiting_page") and not pending_posts[uid].get("page_id_selected"):
+                line_api.reply_message(event.reply_token, TextMessage(text="📌 จะโพสต์ลงเพจไหน?\n1. ก๊อดเองแม่ตั้งให้\n2. GETUP DEAL\n\nพิมพ์ 1 หรือ 2"))
+                pending_posts[uid]["awaiting_page"] = True
+                return
+            if pending_posts[uid].get("awaiting_page"):
+                line_api.reply_message(event.reply_token, TextMessage(text="📌 กรุณาเลือกเพจก่อน: พิมพ์ 1 (ก๊อดเองแม่ตั้งให้) หรือ 2 (GETUP DEAL)"))
+                return
             pending = pending_posts.pop(uid)
-            result = post_to_facebook(pending["text"], pending["image_url"], pending["schedule"])
-            create_draft(pending["text"], pending["image_url"], pending["schedule"])
+            result = post_to_facebook(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"))
+            create_draft(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"))
+            pg_name = PAGES.get(pending.get("page_id"), {}).get("name", pending.get("page_id", "ก๊อดเองแม่ตั้งให้"))
             if "success" in result:
                 pid = result["response"].get("id") or result["response"].get("post_id") or ""
-                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: ก๊อดเองแม่ตั้งให้"
+                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}"
             else:
-                reply = f"❌ โพสต์ไม่สำเร็จ: {result.get('error','')[:300]}"
+                reply = f"❌ โพสต์ไม่สำเร็จ ({pg_name}): {result.get('error','')[:300]}"
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
             return
 
@@ -292,16 +346,31 @@ if HAS_LINE:
             pending_posts[uid] = {"text": clean, "image_url": None, "schedule": schedule}
             return
 
-        # เก็บเป็น pending รอการยืนยัน (ตามสเปคต้องถามก่อนโพสต์เสมอ)
-        pending_posts[uid] = {"text": clean, "image_url": image_url, "schedule": schedule}
-        preview = clean[:350]
+        # ไม่ auto เลือกเพจแล้ว - บังคับถามทุกครั้งก่อนโพสต์
+        # เก็บคำใบ้ไว้แสดงเฉยๆ แต่ยังต้องเลือก 1/2 ตอนยืนยัน
+        hint_page = None
+        if any(k in text.lower() for k in ["getup", "get up"]):
+            hint_page = "788732444316483"
+        elif "ก๊อด" in text:
+            hint_page = "104158371681569"
+
+        # เก็บเป็น pending รอการยืนยัน - ยังไม่ล็อก page_id จนกว่าจะเลือก 1/2
+        pending_posts[uid] = {"text": clean, "image_url": image_url, "schedule": schedule, "page_id": None, "page_id_selected": False}
+        if hint_page:
+            pending_posts[uid]["hint_page"] = hint_page
+        preview = clean[:350] if clean else "(ไม่มีข้อความ - มีแต่รูป)"
         img_note = "📸 มีรูปพร้อมโพสต์" if image_url else "📝 ไม่มีรูป (ข้อความล้วน)"
         if schedule:
             sched_note = f"⏰ ตั้งเวลา {schedule.strftime('%d/%m %H:%M น.')} (ต้องล่วงหน้า 10 นาที)"
         else:
             sched_note = "⚡ จะโพสต์ทันที"
+        if hint_page:
+            pg_name = PAGES[hint_page]["name"]
+            page_note = f"📄 เพจที่เดาจากข้อความ: {pg_name} (ยังต้องยืนยัน 1/2)"
+        else:
+            page_note = "📄 เพจ: ยังไม่ได้เลือก (จะให้เลือกตอนพิมพ์ 'ใช่')"
 
-        reply = f"📋 Preview ก่อนโพสต์:\n---\n{preview}\n---\n{img_note}\n{sched_note}\n\n✅ พิมพ์ 'ใช่' เพื่อยืนยันโพสต์\n💡 พิมพ์ 'ช่วยเกลา' ให้ช่วยคิดแคปชันเพิ่ม\n✏️ พิมพ์ข้อความใหม่เพื่อแก้ไข"
+        reply = f"📋 Preview ก่อนโพสต์:\n---\n{preview}\n---\n{img_note} | {sched_note}\n{page_note}\n\n✅ พิมพ์ 'ใช่' เพื่อยืนยันโพสต์\n💡 พิมพ์ 'ช่วยเกลา' ให้ช่วยคิดแคปชันเพิ่ม\n✏️ พิมพ์ข้อความใหม่เพื่อแก้ไข"
         line_api.reply_message(event.reply_token, TextMessage(text=reply))
 
     @handler.add(MessageEvent, message=ImageMessage)
