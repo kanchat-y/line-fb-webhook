@@ -48,9 +48,9 @@ def _load_pages_from_config():
 
 PAGES = _load_pages_from_config() or {
     "104158371681569": {"name": "ก๊อดเองแม่ตั้งให้", "page_token": "", "user_token_env": "META_ACCESS_TOKEN"},
-    "788732444316483": {"name": "GETUP DEAL", "page_token": "", "user_token_env": "META_ACCESS_TOKEN_GETUPDEAL"}
+    "788732444316483": {"name": "GETUP DEAL", "page_token": "EAAOEO2TluZCYBSh4k6cC3axuXama9Kglc6P4E9Cw8KdzDxtko7Ue3OaQQT9BMmx4ilXBmWki1n1GnUbLKDg0FhKCftT4vUcewWNOlG7lBETlbVqmtJmdJKJTn3C92xfrtR4TH4sjnZAWD6jrGbhfDbsLAUHhPfpddtqrfdZArEiSZAht4fxonVQat76o0V1ZCFji1W18m", "user_token_env": "META_ACCESS_TOKEN_GETUPDEAL"}
 }
-# ถ้ามี hardcoded page_token เก่าให้ล้างออก - ให้ใช้ env แทน (ปลอดภัยกว่า)
+# GETUP DEAL page_token นี้ expires_at=0 (ไม่หมดอายุ) จาก long-lived user token 989815560846326 - อัปเดต 18 Sep 2026
 PAGE_ID = "104158371681569"  # ค่าเริ่มต้น
 
 def load_json(p, default):
