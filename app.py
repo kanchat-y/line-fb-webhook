@@ -372,7 +372,10 @@ if HAS_LINE:
             sched_note = f"⏰ ตั้งเวลา {schedule.strftime('%d/%m %H:%M น.')} (ต้องล่วงหน้า 10 นาที)"
         else:
             sched_note = "⚡ จะโพสต์ทันที"
-        if hint_page:
+        if FORCE_PAGE_ID:
+            pg_name = PAGES[FORCE_PAGE_ID]["name"]
+            page_note = f"\U0001f4c4 \u0e40\u0e1e\u0e08: {pg_name} (\u0e25\u0e47\u0e2d\u0e04\u0e44\u0e27\u0e49 - \u0e1e\u0e34\u0e21\u0e1e\u0e4c \u0e43\u0e0a\u0e48 \u0e40\u0e1e\u0e37\u0e48\u0e2d\u0e42\u0e1e\u0e2a\u0e15\u0e4c\u0e40\u0e25\u0e22)"
+        elif hint_page:
             pg_name = PAGES[hint_page]["name"]
             page_note = f"📄 เพจที่เดาจากข้อความ: {pg_name} (ยังต้องยืนยัน 1/2)"
         else:
