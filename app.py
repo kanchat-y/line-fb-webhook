@@ -52,6 +52,10 @@ PAGES = _load_pages_from_config() or {
 }
 # GETUP DEAL page_token นี้ expires_at=0 (ไม่หมดอายุ) จาก long-lived user token 989815560846326 - อัปเดต 18 Sep 2026
 PAGE_ID = "104158371681569"  # ค่าเริ่มต้น
+FORCE_PAGE_ID = __import__("os").environ.get("FORCE_PAGE_ID") or __import__("os").environ.get("DEFAULT_PAGE_ID")  # ถ้าตั้งไว้จะล็อคเพจเดียวไม่ถามเลือก
+if FORCE_PAGE_ID:
+    PAGE_ID = FORCE_PAGE_ID
+    print(f"[FORCE] Locked to page {PAGE_ID}")
 
 def load_json(p, default):
     return json.loads(Path(p).read_text(encoding="utf-8")) if Path(p).exists() else default
@@ -283,14 +287,17 @@ if HAS_LINE:
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
             return
 
-        # 1. ถ้าพิมพ์ "ใช่" / "ยืนยัน" / "โพสต์เลย" -> ต้องเลือกเพจก่อนโพสต์เสมอ
+        # 1. ถ้าพิมพ์ "ใช่" / "ยืนยัน" / "โพสต์เลย" -> ต้องเลือกเพจก่อนโพสต์เสมอ (ถ้า FORCE_PAGE_ID จะโพสต์เลยไม่ถาม)
         if text in ["ใช่", "ใช่ครับ", "ยืนยัน", "โพสต์เลย", "ตกลง"] and uid in pending_posts:
-            # บังคับถามเลือกเพจทุกครั้ง (ตามคำขอ)
-            if not pending_posts[uid].get("awaiting_page") and not pending_posts[uid].get("page_id_selected"):
+            if FORCE_PAGE_ID:
+                pending_posts[uid]["page_id"] = FORCE_PAGE_ID
+                pending_posts[uid]["page_id_selected"] = True
+            # บังคับถามเลือกเพจทุกครั้ง (ตามคำขอ) - ข้ามถ้า FORCE
+            if not FORCE_PAGE_ID and not pending_posts[uid].get("awaiting_page") and not pending_posts[uid].get("page_id_selected"):
                 line_api.reply_message(event.reply_token, TextMessage(text="📌 จะโพสต์ลงเพจไหน?\n1. ก๊อดเองแม่ตั้งให้\n2. GETUP DEAL\n\nพิมพ์ 1 หรือ 2"))
                 pending_posts[uid]["awaiting_page"] = True
                 return
-            if pending_posts[uid].get("awaiting_page"):
+            if not FORCE_PAGE_ID and pending_posts[uid].get("awaiting_page"):
                 line_api.reply_message(event.reply_token, TextMessage(text="📌 กรุณาเลือกเพจก่อน: พิมพ์ 1 (ก๊อดเองแม่ตั้งให้) หรือ 2 (GETUP DEAL)"))
                 return
             pending = pending_posts.pop(uid)
@@ -346,18 +353,19 @@ if HAS_LINE:
             pending_posts[uid] = {"text": clean, "image_url": None, "schedule": schedule}
             return
 
-        # ไม่ auto เลือกเพจแล้ว - บังคับถามทุกครั้งก่อนโพสต์
-        # เก็บคำใบ้ไว้แสดงเฉยๆ แต่ยังต้องเลือก 1/2 ตอนยืนยัน
-        hint_page = None
-        if any(k in text.lower() for k in ["getup", "get up"]):
-            hint_page = "788732444316483"
-        elif "ก๊อด" in text:
-            hint_page = "104158371681569"
-
-        # เก็บเป็น pending รอการยืนยัน - ยังไม่ล็อก page_id จนกว่าจะเลือก 1/2
-        pending_posts[uid] = {"text": clean, "image_url": image_url, "schedule": schedule, "page_id": None, "page_id_selected": False}
-        if hint_page:
-            pending_posts[uid]["hint_page"] = hint_page
+        # ถ้า FORCE_PAGE_ID จะล็อคเพจเลยไม่ถาม
+        if FORCE_PAGE_ID:
+            pending_posts[uid] = {"text": clean, "image_url": image_url, "schedule": schedule, "page_id": FORCE_PAGE_ID, "page_id_selected": True}
+        else:
+            # ไม่ auto เลือกเพจแล้ว - บังคับถามทุกครั้งก่อนโพสต์
+            hint_page = None
+            if any(k in text.lower() for k in ["getup", "get up"]):
+                hint_page = "788732444316483"
+            elif "ก๊อด" in text:
+                hint_page = "104158371681569"
+            pending_posts[uid] = {"text": clean, "image_url": image_url, "schedule": schedule, "page_id": None, "page_id_selected": False}
+            if hint_page:
+                pending_posts[uid]["hint_page"] = hint_page
         preview = clean[:350] if clean else "(ไม่มีข้อความ - มีแต่รูป)"
         img_note = "📸 มีรูปพร้อมโพสต์" if image_url else "📝 ไม่มีรูป (ข้อความล้วน)"
         if schedule:
