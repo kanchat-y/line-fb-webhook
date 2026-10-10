@@ -453,6 +453,20 @@ if HAS_LINE:
             return
 
         if text in ["เลือกเพจ", "เปลี่ยนเพจ", "เลือกเพจใหม่"]:
+            if FORCE_PAGE_ID:
+                pg_name = PAGES.get(FORCE_PAGE_ID, {}).get("name", FORCE_PAGE_ID)
+                p = pending_posts.get(uid)
+                if p is not None:
+                    p["page_id"] = FORCE_PAGE_ID
+                    p["page_id_selected"] = True
+                    p.pop("awaiting_page", None)
+                    link_richmenu_to_user(uid, RICHMENU_MAIN_ID)
+                    preview = (p.get("text") or "(ไม่มีข้อความ)")[:350]
+                    sched = f"⏰ ตั้งเวลา {p['schedule'].strftime('%d/%m %H:%M')}" if p.get("schedule") else "⚡ โพสต์ทันที"
+                    line_api.reply_message(event.reply_token, TextMessage(text=f"✅ เลือกเพจอัตโนมัติ: {pg_name} (ล็อคไว้)\n📋 Preview:\n---\n{preview}\n---\n{_media_note(p)} | {sched}\n\nกดปุ่ม 'โพสต์' จากเมนูเพื่อยืนยันโพสต์ (หรือพิมพ์ 'ใช่')"))
+                else:
+                    line_api.reply_message(event.reply_token, TextMessage(text=f"📄 เพจ: {pg_name} (ล็อคไว้ — ส่งรูป/วิดีโอ + ข้อความมาได้เลย)"))
+                return
             p = pending_posts.get(uid)
             if p is not None:
                 p["awaiting_page"] = True
@@ -616,7 +630,7 @@ if HAS_LINE:
 
         # 3. ข้อความใหม่ - แยกเวลาและทำความสะอาด
         schedule = parse_schedule(text)
-        clean = re.sub(r'โพสต์.*|ตั้งเวลา.*|\d{1,2}:\d{2}|พรุ่งนี้', '', text).strip()
+        clean = re.sub(r'โพสต์เลย|โพสท์เลย|โพสต์\s*\d.*|โพสท์\s*\d.*|ตั้งเวลา.*|\b\d{1,2}:\d{2}\b|พรุ่งนี้', '', text).strip()
         if not clean:
             clean = text
 
