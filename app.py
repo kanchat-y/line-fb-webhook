@@ -318,6 +318,34 @@ if HAS_LINE:
             parts.append(f"🎬 {m} วิดีโอ")
         return " ".join(parts)
 
+    class _RawMessage:
+        """ห่อ dict เป็น message object ให้ LineBotApi.reply_message (เรียก .as_json_dict) ส่งได้"""
+        def __init__(self, payload):
+            self._payload = payload
+        def as_json_dict(self):
+            return self._payload
+
+    def _apply_page(uid, pid, event):
+        """เลือกเพจให้ draft (เรียกได้ทุกจังหวะ) + เด้งเมนูกลับหน้าหลัก + โชว์ preview"""
+        p = pending_posts[uid]
+        p["page_id"] = pid
+        p["page_id_selected"] = True
+        p.pop("awaiting_page", None)
+        link_richmenu_to_user(uid, RICHMENU_MAIN_ID)
+        pg_name = PAGES.get(pid, {}).get("name", pid)
+        preview = (p.get("text") or "(ไม่มีข้อความ)")[:350]
+        sched = f"⏰ ตั้งเวลา {p['schedule'].strftime('%d/%m %H:%M')}" if p.get("schedule") else "⚡ โพสต์ทันที"
+        line_api.reply_message(event.reply_token, TextMessage(text=f"✅ เลือกเพจ: {pg_name}\n📋 Preview:\n---\n{preview}\n---\n{_media_note(p)} | {sched}\n\nกดปุ่ม 'โพสต์' จากเมนูเพื่อยืนยันโพสต์ (หรือพิมพ์ 'ใช่')"))
+
+    def _page_choice_message(text="📌 จะโพสต์ลงเพจไหน?\n1. ก๊อดเองแม่ตั้งให้\n2. GETUP DEAL\n\nกดเลือกที่เมนูได้เลย"):
+        """ข้อความถามเพจแบบเดียวทุกจุด: แตะปุ่ม / แตะหน้าเมนู / พิมพ์ 1-2 (เข้าที่เดียวกัน)"""
+        from linebot.v3.messaging import TextMessage as V3Text, QuickReply as V3QR, QuickReplyItem as V3Item, MessageAction as V3Act
+        payload = V3Text(text=text, quick_reply=V3QR(items=[
+            V3Item(action=V3Act(label="ก๊อดเองแม่ตั้งให้", text="1")),
+            V3Item(action=V3Act(label="GETUP DEAL", text="2")),
+        ])).to_dict()
+        return _RawMessage(payload)
+
     def gemini_expand(short_text):
         """ใช้ Gemini ฟรีขยายไอเดียสั้นๆ เป็นแคปชันยาว 5-7 บรรทัด"""
         import requests
@@ -398,7 +426,7 @@ if HAS_LINE:
                 img_note = _media_note(p)
                 line_api.reply_message(event.reply_token, TextMessage(text=f"✨ ต้องการโพสต์\n📋 Draft ปัจจุบัน:\n---\n{preview}\n---\n{img_note}\n\nกด 'โพสต์' เพื่อโพสต์ หรือ 'โพสต์ใหม่' เพื่อเริ่มใหม่"))
             else:
-                line_api.reply_message(event.reply_token, TextMessage(text="✨ ต้องการโพสต์\nยังไม่มี draft — ส่งรูป/วิดีโอ + ข้อความมาได้เลย แล้วกด 'โพสต์'"))
+                line_api.reply_message(event.reply_token, TextMessage(text="✨ ต้องการโพสต์\n — ส่งรูป/วิดีโอ + ข้อความมาได้เลย แล้วกด 'โพสต์'"))
             return
 
         if text in ["แก้ไขรูป", "แก้รูป"]:
@@ -429,7 +457,7 @@ if HAS_LINE:
             if p is not None:
                 p["awaiting_page"] = True
                 p["page_id_selected"] = False
-            line_api.reply_message(event.reply_token, TextMessage(text="📌 จะโพสต์ลงเพจไหน?\n1. ก๊อดเองแม่ตั้งให้\n2. GETUP DEAL\n\nพิมพ์ 1 หรือ 2"))
+            line_api.reply_message(event.reply_token, _page_choice_message())
             return
 
         if text in ["โพสต์ใหม่", "เริ่มใหม่", "ล้างทั้งหมด"]:
@@ -457,7 +485,7 @@ if HAS_LINE:
             if not FORCE_PAGE_ID and not p.get("page_id_selected"):
                 p["awaiting_page"] = True
                 p["auto_post"] = True  # เลือกเพจเสร็จให้โพสต์ทันที ไม่ต้องพิมพ์ 'ใช่' ซ้ำ
-                line_api.reply_message(event.reply_token, TextMessage(text="📌 จะโพสต์ลงเพจไหน?\n1. ก๊อดเองแม่ตั้งให้\n2. GETUP DEAL\n\nพิมพ์ 1 หรือ 2"))
+                line_api.reply_message(event.reply_token, _page_choice_message())
                 return
             pending = pending_posts.pop(uid)
             result = post_to_facebook(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
@@ -483,7 +511,7 @@ if HAS_LINE:
                 pending_posts[uid].pop("awaiting_page", None)
                 pending_posts[uid]["page_id_selected"] = True
             else:
-                line_api.reply_message(event.reply_token, TextMessage(text="❓ เลือกเพจไม่ถูก พิมพ์ 1 สำหรับ ก๊อดเองแม่ตั้งให้ หรือ 2 สำหรับ GETUP DEAL"))
+                line_api.reply_message(event.reply_token, _page_choice_message("❓ เลือกเพจไม่ถูก\nแตะปุ่มข้างล่าง หรือพิมพ์ 1 / 2"))
                 return
             link_richmenu_to_user(uid, RICHMENU_MAIN_ID)  # เด้งเมนูกลับหน้าหลัก
             # ถ้ามาจากปุ่ม "โพสต์" ให้โพสต์ทันทีหลังเลือกเพจ ไม่ต้องพิมพ์ 'ใช่' ซ้ำ
@@ -516,11 +544,11 @@ if HAS_LINE:
                 pending_posts[uid]["page_id_selected"] = True
             # บังคับถามเลือกเพจทุกครั้ง (ตามคำขอ) - ข้ามถ้า FORCE
             if not FORCE_PAGE_ID and not pending_posts[uid].get("awaiting_page") and not pending_posts[uid].get("page_id_selected"):
-                line_api.reply_message(event.reply_token, TextMessage(text="📌 จะโพสต์ลงเพจไหน?\n1. ก๊อดเองแม่ตั้งให้\n2. GETUP DEAL\n\nพิมพ์ 1 หรือ 2"))
+                line_api.reply_message(event.reply_token, _page_choice_message())
                 pending_posts[uid]["awaiting_page"] = True
                 return
             if not FORCE_PAGE_ID and pending_posts[uid].get("awaiting_page"):
-                line_api.reply_message(event.reply_token, TextMessage(text="📌 กรุณาเลือกเพจก่อน: พิมพ์ 1 (ก๊อดเองแม่ตั้งให้) หรือ 2 (GETUP DEAL)"))
+                line_api.reply_message(event.reply_token, _page_choice_message())
                 return
             pending = pending_posts.pop(uid)
             result = post_to_facebook(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
@@ -550,8 +578,10 @@ if HAS_LINE:
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
             return
 
-        # 2.1 ถ้าพิมพ์ "สร้างรูป" / "2" -> สร้างรูป AI
-        if text.strip() in ["2", "2.", "สร้างรูป", "ให้ AI สร้างรูป", "สร้างรูปด้วย"] and uid in pending_posts:
+        # 2.1 "สร้างรูป" -> สร้างรูป AI เสมอ / "2" เฉพาะตอน draft ยังว่าง
+        # (draft มีของแล้วเลข 2 = เลือกเพจ ดูบล็อกเลข 1/2 ด้านล่าง)
+        _ai_empty = uid in pending_posts and not (pending_posts[uid].get("text") or _imgs(pending_posts[uid]) or _vids(pending_posts[uid]))
+        if (text.strip() in ["สร้างรูป", "ให้ AI สร้างรูป", "สร้างรูปด้วย"] or (text.strip() in ["2", "2."] and _ai_empty)) and uid in pending_posts:
             pending = pending_posts[uid]
             prompt = pending["text"][:100] if pending["text"] else "football stadium"
             img_url = gemini_image(prompt)
@@ -564,10 +594,25 @@ if HAS_LINE:
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
             return
 
-        # กันปุ่มหน้าเลือกเพจสร้าง draft ขยะเมื่อยังไม่มีอะไรเลย
-        if text in ["ก๊อดเองแม่ตั้งให้", "GETUP DEAL"] and uid not in pending_posts:
-            line_api.reply_message(event.reply_token, TextMessage(text="📌 รับทราบเพจแล้ว แต่ยังไม่มี draft\nส่งรูป + ข้อความมาก่อน แล้วค่อยกด 'โพสต์'"))
+        # ชื่อเพจ: พิมพ์/แตะตอนไหนก็เลือกเพจได้เลย ไม่กินแคปชัน
+        # (exact match เท่านั้น แคปชันที่มีชื่อเพจปนอยู่ยังเป็นแคปชันปกติ)
+        _pick = text.strip().lower()
+        _pid = ("104158371681569" if _pick in ["ก๊อดเองแม่ตั้งให้", "ก๊อดเอง"]
+                else "788732444316483" if _pick in ["getup deal", "getupdeal", "getup"]
+                else None)
+        if _pid:
+            if uid not in pending_posts:
+                line_api.reply_message(event.reply_token, TextMessage(text="📌 รับทราบเพจแล้ว แต่ยังไม่มี draft\nส่งรูป/วิดีโอ + ข้อความมาก่อน แล้วค่อยกด 'โพสต์'"))
+                return
+            _apply_page(uid, _pid, event)
             return
+
+        # เลข 1/2: ถ้า draft มีของแล้ว = เลือกเพจ / ถ้ายังว่าง = ปล่อยผ่าน (2 = สร้างรูป AI, 1 = ถามรูป)
+        if text.strip() in ["1", "1.", "2", "2."]:
+            p = pending_posts.get(uid)
+            if p is not None and not p.get("awaiting_page") and (p.get("text") or _imgs(p) or _vids(p)):
+                _apply_page(uid, "104158371681569" if text.strip().startswith("1") else "788732444316483", event)
+                return
 
         # 3. ข้อความใหม่ - แยกเวลาและทำความสะอาด
         schedule = parse_schedule(text)
@@ -616,7 +661,7 @@ if HAS_LINE:
             page_note = f"\U0001f4c4 \u0e40\u0e1e\u0e08: {pg_name} (\u0e25\u0e47\u0e2d\u0e04\u0e44\u0e27\u0e49 - \u0e01\u0e14 'โพสต์' \u0e40\u0e1e\u0e37\u0e48\u0e2d\u0e42\u0e1e\u0e2a\u0e15\u0e4c\u0e40\u0e25\u0e22)"
         elif hint_page:
             pg_name = PAGES[hint_page]["name"]
-            page_note = f"📄 เพจที่เดาจากข้อความ: {pg_name} (ยังต้องยืนยัน 1/2)"
+            page_note = f"📄 เพจที่เดาจากข้อความ: {pg_name} (แตะปุ่มหรือพิมพ์ 1/2 เพื่อยืนยัน)"
         else:
             page_note = "📄 เพจ: ยังไม่ได้เลือก (จะให้เลือกตอนกด 'โพสต์')"
 
