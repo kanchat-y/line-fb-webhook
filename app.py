@@ -419,14 +419,14 @@ if HAS_LINE:
         uid = event.source.user_id
 
         # === Rich Menu คำสั่งลัด 6 ปุ่ม (ต้องอยู่ก่อน logic อื่น) ===
-        if text in ["✨ ต้องการโพสต์", "ต้องการโพสต์"]:
+        if text in ["✨ ต้องการโพสต์", "ต้องการโพสต์", "เริ่มต้นระบบ"]:
             p = pending_posts.get(uid)
             if p and (p.get("text") or _imgs(p) or _vids(p)):
                 preview = (p.get("text") or "(มีแต่รูป/วิดีโอ)")[:300]
                 img_note = _media_note(p)
-                line_api.reply_message(event.reply_token, TextMessage(text=f"✨ ต้องการโพสต์\n📋 Draft ปัจจุบัน:\n---\n{preview}\n---\n{img_note}\n\nกด 'โพสต์' เพื่อโพสต์ หรือ 'โพสต์ใหม่' เพื่อเริ่มใหม่"))
+                line_api.reply_message(event.reply_token, TextMessage(text=f"📋 Draft ปัจจุบัน:\n---\n{preview}\n---\n{img_note}\n\nกด 'โพสต์' เพื่อโพสต์ หรือ 'ยกเลิกโพสต์' เพื่อล้าง"))
             else:
-                line_api.reply_message(event.reply_token, TextMessage(text="✨ ต้องการโพสต์\n — ส่งรูป/วิดีโอ + ข้อความมาได้เลย แล้วกด 'โพสต์'"))
+                line_api.reply_message(event.reply_token, TextMessage(text="🚀 เริ่มต้นระบบ — ส่งรูป/วิดีโอ + ข้อความมาได้เลย แล้วกด 'โพสต์'"))
             return
 
         if text in ["แก้ไขรูป", "แก้รูป"]:
@@ -474,7 +474,7 @@ if HAS_LINE:
             line_api.reply_message(event.reply_token, _page_choice_message())
             return
 
-        if text in ["โพสต์ใหม่", "เริ่มใหม่", "ล้างทั้งหมด"]:
+        if text in ["โพสต์ใหม่", "เริ่มใหม่", "ล้างทั้งหมด", "ยกเลิกโพสต์", "ยกเลิก"]:
             old_paths = pending_images.pop(uid, []) + pending_videos.pop(uid, [])
             if uid in pending_posts:
                 old_paths += _imgs(pending_posts[uid]) + _vids(pending_posts[uid])
@@ -485,7 +485,7 @@ if HAS_LINE:
                 except Exception:
                     pass
             pending_posts[uid] = {"text": "", "images": [], "videos": [], "image_url": None, "schedule": None, "page_id": None, "page_id_selected": False}
-            line_api.reply_message(event.reply_token, TextMessage(text="🆕 ล้างรูป วิดีโอ และข้อความเก่าหมดแล้ว ✅\nส่งรูป/วิดีโอ + ข้อความชุดใหม่มาได้เลย"))
+            line_api.reply_message(event.reply_token, TextMessage(text="❌ ยกเลิกโพสต์แล้ว — ล้างรูป วิดีโอ และข้อความหมด\nส่งเนื้อหาใหม่ได้เลย"))
             return
 
         if text in ["โพสต์"]:
