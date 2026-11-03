@@ -25,7 +25,7 @@ try:
     from flask import Flask, request, abort
     from linebot import LineBotApi, WebhookHandler
     from linebot.exceptions import InvalidSignatureError
-    from linebot.models import MessageEvent, TextMessage, ImageMessage, VideoMessage
+    from linebot.models import MessageEvent, TextMessage, ImageMessage, VideoMessage, LocationMessage
     HAS_LINE = True
 except ImportError:
     HAS_LINE = False
@@ -86,6 +86,51 @@ def parse_schedule(text):
         now = datetime.datetime.now(bkk)
         return (now + datetime.timedelta(days=1)).replace(hour=9, minute=0, second=0)
     return None
+
+# ==== โลเคชั่น: รับพิกัดจาก LIFF / LINE แล้วแนบลงแคปชันตอนโพสต์ ====
+# รูปแบบข้อความจากหน้า LIFF: "LOCATION 13.756300,100.501800"
+LOCATION_CMD_RE = re.compile(r"^LOCATION\s+(-?\d{1,3}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)\s*$", re.IGNORECASE)
+# แบบที่ผู้ใช้คัดลอกพิกัดมาวางเอง (ต้องมีทศนิยม 4 หลักขึ้นไป กันแคปชันธรรมดาโดนเข้าใจผิด)
+LOCATION_LOOSE_RE = re.compile(r"^\s*(-?\d{1,3}\.\d{4,})\s*,\s*(-?\d{1,3}\.\d{4,})\s*$")
+
+
+def valid_coords(lat, lng):
+    """เช็คว่าพิกัดอยู่ในช่วงที่ถูกต้อง"""
+    try:
+        lat, lng = float(lat), float(lng)
+    except (TypeError, ValueError):
+        return False
+    return -90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0
+
+
+def maps_url(lat, lng):
+    """สร้างลิงก์ Google Maps (ไม่ต้องใช้ API key)"""
+    return f"https://www.google.com/maps?q={float(lat):.6f},{float(lng):.6f}"
+
+
+def parse_location_text(text):
+    """เจอพิกัดในข้อความไหม -> (lat, lng) หรือ None"""
+    if not text:
+        return None
+    m = LOCATION_CMD_RE.match(text.strip()) or LOCATION_LOOSE_RE.match(text.strip())
+    if not m:
+        return None
+    try:
+        lat, lng = float(m.group(1)), float(m.group(2))
+    except (TypeError, ValueError):
+        return None
+    return (lat, lng) if valid_coords(lat, lng) else None
+
+
+def apply_location(text, loc):
+    """ต่อท้ายลิงก์โลเคชั่นให้แคปชัน (คืนข้อความเดิมถ้าไม่มี loc)"""
+    if not loc or not valid_coords(loc.get("lat"), loc.get("lng")):
+        return text if text is not None else ""
+    label = os.environ.get("LOCATION_LABEL", "📍 ตำแหน่งปัจจุบัน").strip() or "📍 ตำแหน่งปัจจุบัน"
+    block = f"{label}\n{maps_url(loc['lat'], loc['lng'])}"
+    base = (text or "").strip()
+    return f"{base}\n\n{block}" if base else block
+
 
 def create_draft(text, image_url=None, schedule=None, page_id=None, images=None, videos=None):
     """สร้าง draft ลง calendar.json"""
@@ -292,6 +337,7 @@ if HAS_LINE:
     pending_images = {}  # user_id -> [image_path, ...] (ไฟล์ที่ยังไม่ได้ผูก draft)
     pending_videos = {}  # user_id -> [video_path, ...]
     pending_posts = {}   # user_id -> {text, images:[...], videos:[...], image_url(รูปแรก), schedule, ...}
+    user_location = {}   # user_id -> {lat, lng, src} (พิกัดที่จะแนบลงแคปชัน อยู่จนกว่าผู้ใช้สั่งปิด)
 
     def _imgs(p):
         return p.get("images") or ([p["image_url"]] if p.get("image_url") else [])
@@ -346,6 +392,84 @@ if HAS_LINE:
         ])).to_dict()
         return _RawMessage(payload)
 
+    def _loc_note(uid):
+        """บรรทัดบอกว่ามีโลเคชั่นจะถูกแนบ (ใช้เติมท้าย preview)"""
+        cur = user_location.get(uid)
+        if not cur:
+            return ""
+        return f"\n📍 โลเคชั่นที่จะแนบ: {maps_url(cur['lat'], cur['lng'])}"
+
+    def _set_location(event, lat, lng, src):
+        """บันทึกพิกัดของผู้ใช้ + ตอบกลับพร้อมลิงก์"""
+        uid = event.source.user_id
+        if not valid_coords(lat, lng):
+            line_api.reply_message(event.reply_token, TextMessage(text="❌ ค่าพิกัดไม่ถูกต้อง (นอกช่วง lat/lng)"))
+            return
+        user_location[uid] = {"lat": float(lat), "lng": float(lng), "src": src}
+        src_txt = "หน้า location (LIFF)" if src == "liff" else "การแชร์ตำแหน่งใน LINE"
+        url = maps_url(lat, lng)
+        p = pending_posts.get(uid)
+        extra = ""
+        if p is not None and (p.get("text") or _imgs(p) or _vids(p)):
+            preview = (p.get("text") or "(ไม่มีข้อความ)")[:300]
+            extra = f"\n\n📋 Preview ปัจจุบัน:\n---\n{preview}\n---\n{_media_note(p)}"
+        line_api.reply_message(event.reply_token, TextMessage(
+            text=f"📍 บันทึกโลเคชั่นแล้ว ({src_txt})\nพิกัด: {float(lat):.6f}, {float(lng):.6f}\n{url}"
+                 f"\n\n✅ จะแนบลงท้ายแคปชันอัตโนมัติตอนกด 'โพสต์'{extra}"
+                 f"\n(พิมพ์ 'ปิด location' เพื่อเลิกแนบ)"))
+
+    def _location_help(event):
+        """ตอบเมื่อผู้ใช้พิมพ์ location"""
+        uid = event.source.user_id
+        cur = user_location.get(uid)
+        if cur:
+            line_api.reply_message(event.reply_token, TextMessage(
+                text=f"📍 โลเคชั่นปัจจุบัน: {float(cur['lat']):.6f}, {float(cur['lng']):.6f}\n{maps_url(cur['lat'], cur['lng'])}"
+                     f"\n✅ จะแนบลงแคปชันตอนกด 'โพสต์'\n\n• พิมพ์ 'ปิด location' = เลิกแนบ\n• กดปุ่ม 📍 location ที่เมนู = อัปเดตพิกัดใหม่"))
+            return
+        line_api.reply_message(event.reply_token, TextMessage(
+            text="📍 ยังไม่มีโลเคชั่นสำหรับแนบ\n\nวิธีตั้ง:\n"
+                 "1️⃣ กดปุ่ม 📍 location ที่ Rich Menu → หน้าเว็บจะดึงตำแหน่งเครื่องให้ (ต้องตั้ง LIFF_ID ก่อน)\n"
+                 "2️⃣ หรือแชร์ตำแหน่งจาก LINE: แตะปุ่ม 📍 ข้างช่องพิมพ์ → เลือกตำแหน่งของคุณ\n"
+                 "3️⃣ หรือพิมพ์เอง: LOCATION 13.756300,100.501800"))
+
+    def _do_ai_caption(uid, event):
+        """คิดแคปชันจากรูปใน draft ด้วย Gemini (vision) แล้วใส่กลับเป็นข้อความ"""
+        p = pending_posts.get(uid)
+        imgs = _imgs(p) if p else []
+        if not imgs:
+            imgs = list(pending_images.get(uid, []))
+        if not imgs:
+            line_api.reply_message(event.reply_token, TextMessage(
+                text="📷 ยังไม่มีรูปให้ AI ดู\nส่งรูปก่อน แล้วพิมพ์ 'คิดแคปชั่น' (หรือกดปุ่มที่เมนู)"))
+            return
+        if not os.environ.get("GEMINI_API_KEY", "").strip():
+            line_api.reply_message(event.reply_token, TextMessage(
+                text="🔑 ยังไม่ได้ตั้งค่า GEMINI_API_KEY บน Render\nตั้งค่าก่อนจึงจะใช้ AI คิดแคปชันได้ (ยังพิมพ์แคปชันเองได้ตามปกติ)"))
+            return
+        hint = (p.get("text") or "").strip()[:150] if p else ""
+        line_api.reply_message(event.reply_token, TextMessage(text="⏳ AI กำลังดูรูปแล้วเขียนแคปชัน..."))
+        caption, err = gemini_caption_from_images(imgs[:4], hint)
+        if not caption:
+            msg = {
+                "no_key": "🔑 ยังไม่ได้ตั้งค่า GEMINI_API_KEY บน Render",
+                "no_image": "❌ อ่านรูปไม่ได้ (ไฟล์หายหรือใหญ่เกินไป) — ส่งรูปใหม่อีกครั้ง",
+            }.get(err, "❌ AI ตอบกลับไม่สำเร็จชั่วคราว — ลองพิมพ์ 'คิดแคปชั่น' อีกครั้ง หรือพิมพ์แคปชันเอง")
+            line_api.reply_message(event.reply_token, TextMessage(text=msg))
+            return
+        if p is None:
+            p = pending_posts[uid] = {"text": "", "images": [], "videos": [], "image_url": None, "schedule": None}
+        for fp in pending_images.pop(uid, []):
+            if fp not in p.setdefault("images", []):
+                p["images"].append(fp)
+        p["text"] = caption
+        _sync_first(p)
+        preview = caption[:400]
+        line_api.reply_message(event.reply_token, TextMessage(
+            text=f"✨ AI เขียนแคปชันจากภาพให้แล้ว ({len(imgs[:4])} รูป):\n---\n{preview}\n---\n"
+                 f"{_media_note(p)} | ⚡ โพสต์ทันที{_loc_note(uid)}\n\n"
+                 f"✅ กด 'โพสต์' จากเมนูเพื่อโพสต์เลย หรือพิมพ์ข้อความใหม่เพื่อแก้"))
+
     def gemini_expand(short_text):
         """ใช้ Gemini ฟรีขยายไอเดียสั้นๆ เป็นแคปชันยาว 5-7 บรรทัด"""
         import requests
@@ -395,6 +519,95 @@ if HAS_LINE:
             text = "✨ " + text
         return text
 
+    def _image_inline(path, max_bytes=6_000_000):
+        """อ่านรูป (local หรือ http) คืน inline_data สำหรับ Gemini — คืน None ถ้าอ่านไม่ได้"""
+        import base64
+        data, mime = None, "image/jpeg"
+        try:
+            if str(path).startswith("http"):
+                import urllib.request
+                with urllib.request.urlopen(str(path), timeout=20) as r:
+                    mime = (r.headers.get("Content-Type", "image/jpeg") or "image/jpeg").split(";")[0].strip()
+                    data = r.read(max_bytes + 1)
+            else:
+                if not Path(str(path)).exists():
+                    return None
+                data = Path(str(path)).read_bytes()
+        except Exception as e:
+            print(f"inline read skip: {path} -> {e}")
+            return None
+        if not data:
+            return None
+        # ถ้ามี PIL ให้ย่อรูป (ลดเวลาอัปโหลด) — ไม่มีก็ใช้ไฟล์เดิม
+        try:
+            from PIL import Image
+            import io
+            im = Image.open(io.BytesIO(data)).convert("RGB")
+            if max(im.size) > 1600:
+                im.thumbnail((1600, 1600))
+            buf = io.BytesIO()
+            im.save(buf, "JPEG", quality=82)
+            data, mime = buf.getvalue(), "image/jpeg"
+        except ImportError:
+            if len(data) > max_bytes:
+                print(f"inline skip (ใหญ่เกิน {max_bytes} bytes ไม่มี PIL ย่อ): {path}")
+                return None
+        except Exception as e:
+            print(f"inline resize skip: {e}")
+        if not data:
+            return None
+        return {"mime_type": mime, "data": base64.b64encode(data).decode("ascii")}
+
+    def gemini_caption_from_images(image_paths, hint=""):
+        """คิดแคปชันภาษาไทยจากรูปด้วย Gemini free tier (vision) -> (caption, err)"""
+        key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if not key:
+            return "", "no_key"
+        parts, n_ok = [], 0
+        for ip in (image_paths or [])[:4]:
+            inl = _image_inline(ip)
+            if inl:
+                parts.append({"inline_data": inl})
+                n_ok += 1
+        if not n_ok:
+            return "", "no_image"
+        model = os.environ.get("GEMINI_VISION_MODEL", "").strip() or "gemini-3.6-flash"
+        target_page = PAGES.get(FORCE_PAGE_ID or PAGE_ID, {}).get("name", "") or "ของเพจ"
+        hint_line = f"- คำใบ้/หัวข้อจากผู้ใช้: {hint}\n" if hint else ""
+        prompt = (
+            f"ดูภาพที่แนบมา {n_ok} รูป แล้วเขียนแคปชันภาษาไทยสำหรับโพสต์ Facebook ของเพจ \"{target_page}\"\n"
+            "กติกา:\n"
+            "- ยาว 5-7 บรรทัด: ทักทาย เล่าสิ่งที่เห็นในภาพจริง (จุดเด่น บรรยากาศ รายละเอียด) ปิดด้วยคำถามชวนคุย\n"
+            "- โทนเป็นกันเอง สนุก ชวนคอมเมนต์/แชร์ ใส่อีโมจิ 1-2 ตัว\n"
+            f"- ใส่แฮชแท็ก 3-5 อัน (ต้องมี #{str(target_page).replace(' ', '')} ถ้าไม่ใช่ 'ของเพจ')\n"
+            f"{hint_line}"
+            "- ตอบเป็นแคปชันอย่างเดียว ไม่ต้องมีคำบรรยายเสริม ไม่ต้องขึ้นต้นว่า \"แคปชัน:\" ไม่ต้องใส่ขีดคั่นครอบ"
+        )
+        payload = json.dumps({"contents": [{"parts": parts + [{"text": prompt}]}]}, ensure_ascii=False)
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        import urllib.request
+        try:
+            req = urllib.request.Request(url, data=payload.encode("utf-8"), method="POST")
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                j = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            try:
+                body = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                body = str(e)[:300]
+            print(f"gemini_caption error: {body}")
+            return "", "api_error"
+        try:
+            parts_out = j["candidates"][0]["content"]["parts"]
+            txt = next((p.get("text", "").strip() for p in parts_out if p.get("text")), "")
+        except Exception as e:
+            print(f"gemini_caption parse error: {e} -> {str(j)[:300]}")
+            return "", "bad_response"
+        if not txt:
+            return "", "bad_response"
+        return txt, ""
+
     @app.route("/ping", methods=["GET"])
     def ping():
         return "OK", 200
@@ -402,6 +615,212 @@ if HAS_LINE:
     @app.route("/", methods=["GET"])
     def index():
         return "LINE-FB Webhook running. POST /line-webhook for LINE.", 200
+
+    # หน้าเว็บ LIFF สำหรับปุ่ม location (เปิดจาก Rich Menu -> ดึง GPS เครื่อง -> ส่งพิกัดกลับแชท)
+    LIFF_HTML = """<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>📍 ระบุตำแหน่ง</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; min-height:100vh; background:#0B0B0D; color:#F5F0E1;
+         font-family:-apple-system,BlinkMacSystemFont,"Noto Sans Thai","Leelawadee UI",Tahoma,sans-serif;
+         display:flex; align-items:center; justify-content:center; padding:18px; }
+  .card { width:100%; max-width:460px; background:#121215; border:1px solid #C9A227;
+          border-radius:16px; padding:22px 18px 24px; text-align:center; }
+  h1 { margin:4px 0 12px; font-size:21px; color:#C9A227; }
+  #status { margin:8px 0; min-height:26px; font-size:15px; line-height:1.7; }
+  .coords { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:15px;
+            background:#1A1A1E; border:1px solid #2C2C31; border-radius:10px; padding:10px 8px;
+            color:#F5F0E1; word-break:break-all; }
+  .maplink { display:inline-block; margin-top:10px; color:#C9A227; font-size:15px; }
+  button { display:block; width:100%; margin-top:14px; padding:15px 12px; font-size:17px; font-weight:700;
+           border:0; border-radius:10px; background:#C9A227; color:#0B0B0D; }
+  button.secondary { background:#1C1C21; color:#F5F0E1; border:1px solid #3A3A40; font-weight:600; font-size:15px; }
+  button:disabled { opacity:.55; }
+  .err { margin-top:12px; background:#2A1416; color:#FF9B9B; border:1px solid #5A2A2E;
+         border-radius:10px; padding:10px; font-size:14px; line-height:1.7; text-align:left; }
+  .hint { display:none; margin-top:12px; background:#16161A; border:1px solid #2C2C31; border-radius:10px;
+          padding:10px 12px; font-size:13.5px; line-height:1.9; color:#A9A492; text-align:left; }
+  .hint b { color:#F5F0E1; }
+  .sp { display:inline-block; width:15px; height:15px; border:2px solid #C9A227;
+        border-top-color:transparent; border-radius:50%; animation:spin .8s linear infinite; vertical-align:-3px; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📍 ระบุตำแหน่งของคุณ</h1>
+  <p id="status"><span class="sp"></span> กำลังเตรียมตัว...</p>
+  <div id="result" style="display:none">
+    <div class="coords" id="coords">-</div>
+    <a class="maplink" id="maplink" href="#" target="_blank" rel="noopener">เปิดใน Google Maps ↗</a>
+  </div>
+  <button id="send" style="display:none">✅ ส่งตำแหน่งเข้าแชท</button>
+  <button id="copy" class="secondary" style="display:none">📋 คัดลอกข้อความพิกัด</button>
+  <button id="retry" class="secondary" style="display:none">🔄 ลองหาตำแหน่งใหม่</button>
+  <div id="err" class="err" style="display:none"></div>
+  <div id="hint" class="hint">
+    <b>ถ้าปุ่มส่งไม่ขึ้น หรือกดแล้วไม่ทำงาน</b><br>
+    • ต้องเปิดหน้านี้จากในแชท LINE (กดปุ่ม 📍 location ที่เมนู)<br>
+    • กด "คัดลอก" แล้ว<b>วางในแชท</b>ส่งให้บอทแทนได้<br>
+    • iPhone: การตั้งค่า → ความเป็นส่วนตัว → บริการตำแหน่ง → LINE = อนุญาต<br>
+    • Android: การตั้งค่า → ตำแหน่ง → เปิด + อนุญาตให้ LINE
+  </div>
+</div>
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<script>
+(function () {
+  var LIFF_ID = "__LIFF_ID__";
+  var statusEl = document.getElementById("status");
+  var coordsEl = document.getElementById("coords");
+  var mapEl = document.getElementById("maplink");
+  var resultEl = document.getElementById("result");
+  var sendBtn = document.getElementById("send");
+  var copyBtn = document.getElementById("copy");
+  var retryBtn = document.getElementById("retry");
+  var errEl = document.getElementById("err");
+  var hintEl = document.getElementById("hint");
+  var pos = null, canSend = false, sending = false;
+
+  function show(el, on) { el.style.display = on ? "" : "none"; }
+  function setStatus(html) { statusEl.innerHTML = html; }
+  function showErr(msg, retry) {
+    errEl.innerHTML = msg;
+    show(errEl, true);
+    show(retryBtn, !!retry);
+    setStatus("");
+  }
+  function payload() {
+    return "LOCATION " + pos.lat.toFixed(6) + "," + pos.lng.toFixed(6);
+  }
+  function onGot(p) {
+    pos = { lat: p.coords.latitude, lng: p.coords.longitude };
+    coordsEl.textContent = pos.lat.toFixed(6) + ", " + pos.lng.toFixed(6);
+    mapEl.href = "https://www.google.com/maps?q=" + pos.lat.toFixed(6) + "," + pos.lng.toFixed(6);
+    show(resultEl, true);
+    show(copyBtn, true);
+    show(retryBtn, false);
+    show(errEl, false);
+    if (canSend) {
+      show(sendBtn, true);
+      setStatus("✅ ได้ตำแหน่งแล้ว<br>กดปุ่มด้านล่างเพื่อส่งเข้าแชท");
+    } else {
+      show(sendBtn, false);
+      show(hintEl, true);
+      setStatus("✅ ได้ตำแหน่งแล้ว แต่ส่งอัตโนมัติไม่ได้<br>คัดลอกแล้ววางในแชทแทน");
+    }
+  }
+  function onGeoErr(e) {
+    var msg = "หาตำแหน่งไม่สำเร็จ";
+    if (e && e.code === 1) { msg = "คุณยังไม่อนุญาตให้เข้าถึงตำแหน่ง"; }
+    else if (e && e.code === 2) { msg = "สัญญาณตำแหน่งใช้ไม่ได้ (ลองกลางแจ้ง หรือเปิด GPS + Wi-Fi)"; }
+    else if (e && e.code === 3) { msg = "หมดเวลาคอยตำแหน่ง"; }
+    show(hintEl, true);
+    showErr("❌ " + msg + "<br>แตะ 'ลองใหม่' หรือคัดลอกพิกัดเอง", true);
+  }
+  function getLoc() {
+    show(errEl, false);
+    show(retryBtn, false);
+    if (!navigator.geolocation) {
+      show(hintEl, true);
+      showErr("❌ อุปกรณ์นี้ไม่รองรับการระบุตำแหน่ง", false);
+      return;
+    }
+    setStatus('<span class="sp"></span> กำลังขอตำแหน่งจากเครื่อง...');
+    navigator.geolocation.getCurrentPosition(onGot, onGeoErr,
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 0 });
+  }
+  function send() {
+    if (sending || !pos || !window.liff) { return; }
+    sending = true;
+    sendBtn.disabled = true;
+    sendBtn.textContent = "⏳ กำลังส่ง...";
+    var msg = payload();
+    liff.sendMessages([{ type: "text", text: msg }]).then(function () {
+      setStatus("✅ ส่งเรียบร้อย — กำลังปิดหน้าต่าง...");
+      show(sendBtn, false);
+      setTimeout(function () {
+        try { (liff.closeWindow ? liff.closeWindow() : liff.close()); } catch (e) {}
+      }, 500);
+    }).catch(function (err) {
+      sending = false;
+      sendBtn.disabled = false;
+      sendBtn.textContent = "✅ ส่งตำแหน่งเข้าแชท";
+      show(hintEl, true);
+      showErr("❌ ส่งข้อความไม่สำเร็จ: " + (err && err.message ? err.message : err) +
+              "<br>ต้องเปิดจากในแชท LINE — หรือใช้ปุ่มคัดลอกด้านล่าง", false);
+    });
+  }
+  function legacyCopy(t, done) {
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = t;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (ok) { done(); } else { showErr("คัดลอกไม่สำเร็จ — กดค้างที่บรรทัดพิกัดเพื่อคัดลอกเอง", false); }
+    } catch (e) { showErr("คัดลอกไม่สำเร็จ — กดค้างที่บรรทัดพิกัดเพื่อคัดลอกเอง", false); }
+  }
+  function copy() {
+    if (!pos) { return; }
+    var t = payload();
+    var done = function () {
+      copyBtn.textContent = "✅ คัดลอกแล้ว — วางในแชทได้เลย";
+      setStatus("คัดลอกเรียบร้อย<br>กลับไปที่แชท แล้ว<b>วาง + ส่ง</b>ให้บอท");
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(done).catch(function () { legacyCopy(t, done); });
+    } else { legacyCopy(t, done); }
+  }
+  function initLiff() {
+    if (!LIFF_ID || LIFF_ID.indexOf("__") === 0) {
+      show(hintEl, true);
+      showErr("⚠️ ยังไม่ได้ตั้งค่า <b>LIFF_ID</b> บน Render<br>ดึงตำแหน่งได้แล้ว — คัดลอกไปวางในแชทแทน", false);
+      getLoc();
+      return;
+    }
+    if (!window.liff) {
+      show(hintEl, true);
+      showErr("❌ โหลด LIFF SDK ไม่สำเร็จ (เน็ต/สคริปต์ถูกบล็อก)", true);
+      getLoc();
+      return;
+    }
+    liff.init({ liffId: LIFF_ID }).then(function () {
+      var inClient = (typeof liff.isInClient === "function") ? liff.isInClient() : true;
+      var avail = (typeof liff.isApiAvailable === "function") ? liff.isApiAvailable("sendMessages") : true;
+      canSend = !!(inClient && avail);
+      if (!inClient) { show(hintEl, true); }
+      getLoc();
+    }).catch(function (err) {
+      canSend = false;
+      show(hintEl, true);
+      showErr("❌ เปิด LIFF ไม่สำเร็จ: " + (err && err.message ? err.message : err), true);
+      getLoc();
+    });
+  }
+  sendBtn.addEventListener("click", send);
+  copyBtn.addEventListener("click", copy);
+  retryBtn.addEventListener("click", getLoc);
+  initLiff();
+})();
+</script>
+</body>
+</html>"""
+
+    @app.route("/liff/location", methods=["GET"])
+    def liff_location():
+        """หน้าดึงตำแหน่งเครื่อง (LIFF Endpoint) — ค่า LIFF_ID ฉีดจาก env ทุกครั้งที่เรียก"""
+        liff_id = (os.environ.get("LIFF_ID", "") or "").strip()
+        html = LIFF_HTML.replace("__LIFF_ID__", liff_id)
+        return html, 200, {"Content-Type": "text/html; charset=utf-8"}
+
 
     @app.route("/line-webhook", methods=["POST"])
     def line_webhook():
@@ -424,7 +843,7 @@ if HAS_LINE:
             if p and (p.get("text") or _imgs(p) or _vids(p)):
                 preview = (p.get("text") or "(มีแต่รูป/วิดีโอ)")[:300]
                 img_note = _media_note(p)
-                line_api.reply_message(event.reply_token, TextMessage(text=f"📋 Draft ปัจจุบัน:\n---\n{preview}\n---\n{img_note}\n\nกด 'โพสต์' เพื่อโพสต์ หรือ 'ยกเลิกโพสต์' เพื่อล้าง"))
+                line_api.reply_message(event.reply_token, TextMessage(text=f"📋 Draft ปัจจุบัน:\n---\n{preview}\n---\n{img_note}{_loc_note(uid)}\n\nกด 'โพสต์' เพื่อโพสต์ หรือ 'ยกเลิกโพสต์' เพื่อล้าง"))
             else:
                 line_api.reply_message(event.reply_token, TextMessage(text="🚀 เริ่มต้นระบบ — ส่งรูป/วิดีโอ + ข้อความมาได้เลย แล้วกด 'โพสต์'"))
             return
@@ -502,15 +921,43 @@ if HAS_LINE:
                 line_api.reply_message(event.reply_token, _page_choice_message())
                 return
             pending = pending_posts.pop(uid)
-            result = post_to_facebook(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
-            create_draft(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
+            _ploc = user_location.get(uid)
+            final_text = apply_location(pending.get("text"), _ploc)
+            result = post_to_facebook(final_text, pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
+            create_draft(final_text, pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
             pg_name = PAGES.get(pending.get("page_id"), {}).get("name", pending.get("page_id", ""))
             if "success" in result:
                 pid = result["response"].get("id") or result["response"].get("post_id") or ""
-                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}"
+                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}" + ("\n📍 แนบโลเคชั่นในแคปชันแล้ว" if _ploc else "")
             else:
                 reply = f"❌ โพสต์ไม่สำเร็จ ({pg_name}): {result.get('error','')[:300]}"
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
+            return
+
+        # === โลเคชั่น + AI คิดแคปชัน (ต้องอยู่ก่อนบล็อก "เลือกเพจ" ไม่งั้นคำสั่งจะโดนกิน) ===
+        _loc = parse_location_text(text)
+        if _loc:
+            _set_location(event, _loc[0], _loc[1], "liff" if text.strip().upper().startswith("LOCATION") else "text")
+            return
+
+        _low = text.strip().lower()
+        if _low in ["location", "โลเคชั่น", "โลเคชั่นปัจจุบัน", "ตำแหน่ง", "ตำแหน่งปัจจุบัน", "ดูโลเคชั่น"]:
+            _location_help(event)
+            return
+        if _low in ["ปิด location", "ปิดโลเคชั่น", "ปิด โลเคชั่น", "ลบ location", "ลบโลเคชั่น",
+                    "เลิกแนบ location", "เลิกแนบโลเคชั่น", "ไม่เอา location"]:
+            if user_location.pop(uid, None):
+                line_api.reply_message(event.reply_token, TextMessage(
+                    text="📍 ปิดการแนบโลเคชั่นแล้ว\nโพสต์ถัดไปจะไม่มีลิงก์ตำแหน่ง\n(พิมพ์ 'location' เพื่อดู/ตั้งใหม่)"))
+            else:
+                line_api.reply_message(event.reply_token, TextMessage(
+                    text="ℹ️ ยังไม่มีโลเคชั่นที่ตั้งไว้อยู่แล้ว\n(พิมพ์ 'location' เพื่อดูวิธีตั้ง)"))
+            return
+
+        if _low in ["คิดแคปชั่น", "เขียนแคปชั่น", "คิดแคปชั่นจากภาพ", "เขียนแคปชั่นจากภาพ",
+                    "คิดแคปชัน", "เขียนแคปชัน", "คิด caption", "เขียน caption",
+                    "ให้ ai เขียนแคปชั่น", "ให้ ai คิดแคปชั่น", "คิดแคปชั่นให้หน่อย"]:
+            _do_ai_caption(uid, event)
             return
 
         # 0. เลือกเพจ (ถ้ารอเลือกเพจอยู่) - บังคับทุกครั้งก่อนโพสต์
@@ -531,12 +978,14 @@ if HAS_LINE:
             # ถ้ามาจากปุ่ม "โพสต์" ให้โพสต์ทันทีหลังเลือกเพจ ไม่ต้องพิมพ์ 'ใช่' ซ้ำ
             if pending_posts[uid].pop("auto_post", None):
                 pending = pending_posts.pop(uid)
-                result = post_to_facebook(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
-                create_draft(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
+                _ploc = user_location.get(uid)
+                final_text = apply_location(pending.get("text"), _ploc)
+                result = post_to_facebook(final_text, pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
+                create_draft(final_text, pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
                 pg_name = PAGES.get(pending.get("page_id"), {}).get("name", pending.get("page_id", ""))
                 if "success" in result:
                     pid = result["response"].get("id") or result["response"].get("post_id") or ""
-                    reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}"
+                    reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}" + ("\n📍 แนบโลเคชั่นในแคปชันแล้ว" if _ploc else "")
                 else:
                     reply = f"❌ โพสต์ไม่สำเร็จ ({pg_name}): {result.get('error','')[:300]}"
                 line_api.reply_message(event.reply_token, TextMessage(text=reply))
@@ -565,12 +1014,14 @@ if HAS_LINE:
                 line_api.reply_message(event.reply_token, _page_choice_message())
                 return
             pending = pending_posts.pop(uid)
-            result = post_to_facebook(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
-            create_draft(pending["text"], pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
+            _ploc = user_location.get(uid)
+            final_text = apply_location(pending.get("text"), _ploc)
+            result = post_to_facebook(final_text, pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
+            create_draft(final_text, pending["image_url"], pending["schedule"], pending.get("page_id"), images=pending.get("images"), videos=pending.get("videos"))
             pg_name = PAGES.get(pending.get("page_id"), {}).get("name", pending.get("page_id", "ก๊อดเองแม่ตั้งให้"))
             if "success" in result:
                 pid = result["response"].get("id") or result["response"].get("post_id") or ""
-                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}"
+                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}" + ("\n📍 แนบโลเคชั่นในแคปชันแล้ว" if _ploc else "")
             else:
                 reply = f"❌ โพสต์ไม่สำเร็จ ({pg_name}): {result.get('error','')[:300]}"
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
@@ -679,8 +1130,18 @@ if HAS_LINE:
         else:
             page_note = "📄 เพจ: ยังไม่ได้เลือก (จะให้เลือกตอนกด 'โพสต์')"
 
-        reply = f"📋 Preview ก่อนโพสต์:\n---\n{preview}\n---\n{img_note} | {sched_note}\n{page_note}\n\n✅ กดปุ่ม 'โพสต์' จากเมนูเพื่อโพสต์เลย (หรือพิมพ์ 'ใช่')\n✏️ พิมพ์ข้อความใหม่เพื่อแก้ไข"
+        reply = f"📋 Preview ก่อนโพสต์:\n---\n{preview}\n---\n{img_note} | {sched_note}\n{page_note}{_loc_note(uid)}\n\n✅ กดปุ่ม 'โพสต์' จากเมนูเพื่อโพสต์เลย (หรือพิมพ์ 'ใช่')\n✏️ พิมพ์ข้อความใหม่เพื่อแก้ไข"
         line_api.reply_message(event.reply_token, TextMessage(text=reply))
+
+    @handler.add(MessageEvent, message=LocationMessage)
+    def handle_location(event):
+        """ผู้ใช้แชร์ตำแหน่งจาก LINE (ปุ่ม 📍 ข้างช่องพิมพ์) -> เก็บเป็นโลเคชั่นของ draft"""
+        try:
+            m = event.message
+            _set_location(event, m.latitude, m.longitude, "line")
+        except Exception as e:
+            print(f"handle_location error: {e}")
+            line_api.reply_message(event.reply_token, TextMessage(text=f"❌ อ่านตำแหน่งไม่สำเร็จ: {str(e)[:150]}"))
 
     @handler.add(MessageEvent, message=ImageMessage)
     def handle_image(event):
@@ -703,7 +1164,8 @@ if HAS_LINE:
                 p["images"].append(local_path)
             _sync_first(p)
             n = len(p["images"])
-            line_api.reply_message(event.reply_token, TextMessage(text=f"📸 รับรูปที่ {n} แล้ว! ✅\nส่งรูป/วิดีโอเพิ่มหรือส่งแคปชันได้เลย แล้วกด 'โพสต์' จากเมนู"))
+            _tip = "" if (p.get("text") or "").strip() else "\n💡 พิมพ์ 'คิดแคปชั่น' ให้ AI เขียนจากภาพนี้"
+            line_api.reply_message(event.reply_token, TextMessage(text=f"📸 รับรูปที่ {n} แล้ว! ✅{_tip}\nส่งรูป/วิดีโอเพิ่มหรือส่งแคปชันได้เลย แล้วกด 'โพสต์' จากเมนู"))
         except Exception as e:
             print(f"handle_image error: {e}")
             line_api.reply_message(event.reply_token, TextMessage(text=f"❌ รับรูปไม่สำเร็จ: {str(e)[:200]}"))
