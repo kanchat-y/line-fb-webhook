@@ -123,12 +123,15 @@ def parse_location_text(text):
 
 
 def apply_location(text, loc):
-    """ต่อท้ายลิงก์โลเคชั่นให้แคปชัน (คืนข้อความเดิมถ้าไม่มี loc)"""
+    """ต่อท้ายลิงก์โลเคชั่นให้แคปชัน (คืนข้อความเดิมถ้าไม่มี loc หรือมีลิงก์แล้ว)"""
     if not loc or not valid_coords(loc.get("lat"), loc.get("lng")):
         return text if text is not None else ""
     label = os.environ.get("LOCATION_LABEL", "📍 ตำแหน่งปัจจุบัน").strip() or "📍 ตำแหน่งปัจจุบัน"
-    block = f"{label}\n{maps_url(loc['lat'], loc['lng'])}"
+    url = maps_url(loc['lat'], loc['lng'])
     base = (text or "").strip()
+    if url in base:
+        return base  # มีลิงก์โลเคชั่นนี้อยู่แล้ว (แนบไปตอนคิดแคปชันแล้ว) — ไม่แนบซ้ำ
+    block = f"{label}\n{url}"
     return f"{base}\n\n{block}" if base else block
 
 
@@ -338,6 +341,7 @@ if HAS_LINE:
     pending_videos = {}  # user_id -> [video_path, ...]
     pending_posts = {}   # user_id -> {text, images:[...], videos:[...], image_url(รูปแรก), schedule, ...}
     user_location = {}   # user_id -> {lat, lng, src} (พิกัดที่จะแนบลงแคปชัน อยู่จนกว่าผู้ใช้สั่งปิด)
+    ai_caption_busy = set()  # user_id ที่กำลังให้ AI เขียนแคปชันอยู่ (กัน webhook retry ทำงานซ้ำ)
 
     def _imgs(p):
         return p.get("images") or ([p["image_url"]] if p.get("image_url") else [])
@@ -435,6 +439,12 @@ if HAS_LINE:
 
     def _do_ai_caption(uid, event):
         """คิดแคปชันจากรูปใน draft ด้วย Gemini (vision) แล้วใส่กลับเป็นข้อความ"""
+        if uid in ai_caption_busy:
+            try:
+                line_api.push_message(uid, TextMessage(text="⏳ กำลังเขียนแคปชันอยู่ — รอสักครู่นะ"))
+            except Exception as e:
+                print(f"ai_caption busy push error: {e}")
+            return
         p = pending_posts.get(uid)
         imgs = _imgs(p) if p else []
         if not imgs:
@@ -448,27 +458,46 @@ if HAS_LINE:
                 text="🔑 ยังไม่ได้ตั้งค่า GEMINI_API_KEY บน Render\nตั้งค่าก่อนจึงจะใช้ AI คิดแคปชันได้ (ยังพิมพ์แคปชันเองได้ตามปกติ)"))
             return
         hint = (p.get("text") or "").strip()[:150] if p else ""
-        line_api.reply_message(event.reply_token, TextMessage(text="⏳ AI กำลังดูรูปแล้วเขียนแคปชัน..."))
+        # reply_token ใช้ได้ครั้งเดียว -> ตอบ "⏳" ด้วย reply แล้วส่งผลลัพธ์ด้วย push
+        try:
+            line_api.reply_message(event.reply_token, TextMessage(text="⏳ AI กำลังดูรูปแล้วเขียนแคปชัน..."))
+        except Exception as e:
+            print(f"ai_caption reply skip: {e}")
+        ai_caption_busy.add(uid)
+        try:
+            _do_ai_caption_work(uid, imgs, hint, p)
+        finally:
+            ai_caption_busy.discard(uid)
+
+    def _do_ai_caption_work(uid, imgs, hint, p):
+        def _push(msg):
+            try:
+                line_api.push_message(uid, TextMessage(text=msg))
+            except Exception as e:
+                print(f"ai_caption push error: {e}")
+
         caption, err = gemini_caption_from_images(imgs[:4], hint)
         if not caption:
             msg = {
                 "no_key": "🔑 ยังไม่ได้ตั้งค่า GEMINI_API_KEY บน Render",
                 "no_image": "❌ อ่านรูปไม่ได้ (ไฟล์หายหรือใหญ่เกินไป) — ส่งรูปใหม่อีกครั้ง",
+                "api_error": "❌ AI ยังตอบไม่ได้ชั่วคราว (server ยุ่ง) — รอสักครู่แล้วพิมพ์ 'คิดแคปชั่น' อีกครั้ง",
             }.get(err, "❌ AI ตอบกลับไม่สำเร็จชั่วคราว — ลองพิมพ์ 'คิดแคปชั่น' อีกครั้ง หรือพิมพ์แคปชันเอง")
-            line_api.reply_message(event.reply_token, TextMessage(text=msg))
+            _push(msg)
             return
         if p is None:
             p = pending_posts[uid] = {"text": "", "images": [], "videos": [], "image_url": None, "schedule": None}
         for fp in pending_images.pop(uid, []):
             if fp not in p.setdefault("images", []):
                 p["images"].append(fp)
-        p["text"] = caption
+        # แนบลิงก์ Maps ต่อท้ายแคปชันทันที ถ้าผู้ใช้ตั้งโลเคชั่นไว้ (ตอนโพสต์ apply_location จะไม่แนบซ้ำ)
+        p["text"] = apply_location(caption, user_location.get(uid))
         _sync_first(p)
-        preview = caption[:400]
-        line_api.reply_message(event.reply_token, TextMessage(
-            text=f"✨ AI เขียนแคปชันจากภาพให้แล้ว ({len(imgs[:4])} รูป):\n---\n{preview}\n---\n"
-                 f"{_media_note(p)} | ⚡ โพสต์ทันที{_loc_note(uid)}\n\n"
-                 f"✅ กด 'โพสต์' จากเมนูเพื่อโพสต์เลย หรือพิมพ์ข้อความใหม่เพื่อแก้"))
+        preview = p["text"][:600]
+        _push(
+            f"✨ AI เขียนแคปชันจากภาพให้แล้ว ({len(imgs[:4])} รูป):\n---\n{preview}\n---\n"
+            f"{_media_note(p)} | ⚡ โพสต์ทันที{_loc_note(uid)}\n\n"
+            f"✅ กด 'โพสต์' จากเมนูเพื่อโพสต์เลย หรือพิมพ์ข้อความใหม่เพื่อแก้")
 
     def gemini_expand(short_text):
         """ใช้ Gemini ฟรีขยายไอเดียสั้นๆ เป็นแคปชันยาว 5-7 บรรทัด"""
@@ -574,29 +603,39 @@ if HAS_LINE:
         model = os.environ.get("GEMINI_VISION_MODEL", "").strip() or "gemini-3.6-flash"
         target_page = PAGES.get(FORCE_PAGE_ID or PAGE_ID, {}).get("name", "") or "ของเพจ"
         hint_line = f"- คำใบ้/หัวข้อจากผู้ใช้: {hint}\n" if hint else ""
+        page_tag = str(target_page).replace(" ", "")
         prompt = (
             f"ดูภาพที่แนบมา {n_ok} รูป แล้วเขียนแคปชันภาษาไทยสำหรับโพสต์ Facebook ของเพจ \"{target_page}\"\n"
             "กติกา:\n"
-            "- ยาว 5-7 บรรทัด: ทักทาย เล่าสิ่งที่เห็นในภาพจริง (จุดเด่น บรรยากาศ รายละเอียด) ปิดด้วยคำถามชวนคุย\n"
+            "- ยาว 3-5 บรรทัด: ขึ้นบรรทัดใหม่ระหว่างแต่ละประโยคให้เห็นชัด (นับแถวแฮชแท็กเป็นบรรทัดด้วย) เล่าสิ่งที่เห็นในภาพจริง (จุดเด่น บรรยากาศ รายละเอียด) ให้สัมพันธ์กับรูป ปิดด้วยคำถามชวนคุย\n"
             "- โทนเป็นกันเอง สนุก ชวนคอมเมนต์/แชร์ ใส่อีโมจิ 1-2 ตัว\n"
-            f"- ใส่แฮชแท็ก 3-5 อัน (ต้องมี #{str(target_page).replace(' ', '')} ถ้าไม่ใช่ 'ของเพจ')\n"
+            "- ท้ายแคปชันใส่แฮชแท็ก 4-6 อันที่คนน่าจะค้นหาจริง เกี่ยวกับเนื้อหาในรูป (SEO) เช่น สถานที่/สิ่งของ/กิจกรรม/อารมณ์ที่เห็นในภาพ"
+            + (f" ต้องมี #{page_tag}" if page_tag != "ของเพจ" else "") + "\n"
             f"{hint_line}"
-            "- ตอบเป็นแคปชันอย่างเดียว ไม่ต้องมีคำบรรยายเสริม ไม่ต้องขึ้นต้นว่า \"แคปชัน:\" ไม่ต้องใส่ขีดคั่นครอบ"
+            "- ตอบเป็นแคปชันอย่างเดียว ไม่ต้องมีคำบรรยายเสริม ไม่ต้องขึ้นต้นว่า \"แคปชัน:\" ไม่ต้องใส่ขีดคั่นครอบ ไม่ต้องใส่ลิงก์"
         )
         payload = json.dumps({"contents": [{"parts": parts + [{"text": prompt}]}]}, ensure_ascii=False)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
         import urllib.request
-        try:
-            req = urllib.request.Request(url, data=payload.encode("utf-8"), method="POST")
-            req.add_header("Content-Type", "application/json")
-            with urllib.request.urlopen(req, timeout=30) as r:
-                j = json.loads(r.read().decode("utf-8"))
-        except Exception as e:
+        # retry 3 ครั้ง — free tier มักคืน 503 เป็นบางครั้ง
+        j = None
+        last_err = ""
+        for attempt in range(3):
             try:
-                body = e.read().decode("utf-8", "replace")[:300]
-            except Exception:
-                body = str(e)[:300]
-            print(f"gemini_caption error: {body}")
+                req = urllib.request.Request(url, data=payload.encode("utf-8"), method="POST")
+                req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req, timeout=40) as r:
+                    j = json.loads(r.read().decode("utf-8"))
+                break
+            except Exception as e:
+                try:
+                    last_err = e.read().decode("utf-8", "replace")[:300]
+                except Exception:
+                    last_err = str(e)[:300]
+                print(f"gemini_caption attempt {attempt + 1} error: {last_err}")
+                import time
+                time.sleep(2 * (attempt + 1))
+        if j is None:
             return "", "api_error"
         try:
             parts_out = j["candidates"][0]["content"]["parts"]
