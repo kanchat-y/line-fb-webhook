@@ -65,7 +65,7 @@ appmod._do_ai_caption(uid, Evt())
 check("ไม่มีรูป -> reply 1 ครั้ง", len(sent["reply"]) == 1 and "ยังไม่มีรูป" in sent["reply"][0][1], str(sent))
 sent["reply"].clear()
 
-# 2) มีรูป -> reply '⏳' 1 ครั้ง + push ผลลัพธ์ 1 ครั้ง
+# 2) มีรูป -> reply '⏳' 1 ครั้ง + push ผลลัพธ์ 1 ครั้ง (ทำงานในเธรด -> ต้องรอ)
 img = os.path.join(tempfile.gettempdir(), "fake.jpg")
 open(img, "wb").write(b"\xff\xd8\xff\xe0" + b"0" * 100)
 appmod.pending_images[uid] = [img]
@@ -74,6 +74,12 @@ appmod.user_location[uid] = {"lat": 7.006538, "lng": 100.496597, "src": "line"} 
 Evt.reply_token = "tok_2"
 appmod._do_ai_caption(uid, Evt())
 
+import time as _time
+for _ in range(100):  # รอเธรดทำงานจบ (สูงสุด 10 วิ)
+    if not appmod.ai_caption_busy:
+        break
+    _time.sleep(0.1)
+check("เธรดจบภายใน 10 วิ", not appmod.ai_caption_busy)
 check("มีรูป -> reply ใช้ token แค่ 1 ครั้ง", len(sent["reply"]) == 1, f"reply={len(sent['reply'])}")
 check("ข้อความแรกเป็น ⏳", sent["reply"] and "⏳" in sent["reply"][0][1], str(sent["reply"]))
 check("push ส่งผลลัพธ์ 1 ครั้ง", len(sent["push"]) == 1, f"push={len(sent['push'])}")
@@ -105,6 +111,10 @@ sent["reply"].clear(); sent["push"].clear()
 appmod.pending_images[uid] = [img]
 Evt.reply_token = "tok_4"
 appmod._do_ai_caption(uid, Evt())
+for _ in range(100):
+    if not appmod.ai_caption_busy:
+        break
+    _time.sleep(0.1)
 check("error path: reply 1 + push 1", len(sent["reply"]) == 1 and len(sent["push"]) == 1, f"r={len(sent['reply'])} p={len(sent['push'])}")
 check("error message แจ้ง server ยุ่ง", sent["push"] and "server ยุ่ง" in sent["push"][0][1], str(sent["push"]))
 
@@ -115,7 +125,9 @@ src = inspect.getsource(appmod.__dict__.get("gemini_caption_from_images") or app
 full_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py"), encoding="utf-8").read()
 check("prompt กำหนด 3-5 บรรทัด", "ยาว 3-5 บรรทัด" in full_src)
 check("prompt สั่งแฮชแท็ก SEO ตามรูป", "SEO" in full_src and "เกี่ยวกับเนื้อหาในรูป" in full_src)
-check("มี retry กัน 503", "for attempt in range(3)" in full_src)
+check("มี fallback หลายโมเดล (กันโควตา/503)", "gemini-flash-lite-latest" in full_src and "chain" in full_src)
+check("มี retry ต่อโมเดล", "for attempt in range(2)" in full_src)
+check("แยกเคสโควตาเต็ม", '"quota"' in full_src and "ครบโควตาฟรีวันนี้" in full_src)
 check("ใช้ push_message ส่งผลลัพธ์", "line_api.push_message(uid, TextMessage" in full_src)
 
 # 7) route /ping ยังทำงาน

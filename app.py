@@ -463,11 +463,23 @@ if HAS_LINE:
             line_api.reply_message(event.reply_token, TextMessage(text="⏳ AI กำลังดูรูปแล้วเขียนแคปชัน..."))
         except Exception as e:
             print(f"ai_caption reply skip: {e}")
+        # ทำงานในเธรด -> webhook ตอบ LINE ทันที (กัน LINE retry ส่ง event ซ้ำ)
         ai_caption_busy.add(uid)
-        try:
-            _do_ai_caption_work(uid, imgs, hint, p)
-        finally:
-            ai_caption_busy.discard(uid)
+
+        def _run():
+            try:
+                _do_ai_caption_work(uid, imgs, hint, p)
+            except Exception as e:
+                print(f"ai_caption thread error: {e}")
+                try:
+                    line_api.push_message(uid, TextMessage(text=f"❌ คิดแคปชันไม่สำเร็จ: {str(e)[:150]}"))
+                except Exception as e2:
+                    print(f"ai_caption error push fail: {e2}")
+            finally:
+                ai_caption_busy.discard(uid)
+
+        import threading
+        threading.Thread(target=_run, daemon=True).start()
 
     def _do_ai_caption_work(uid, imgs, hint, p):
         def _push(msg):
@@ -481,6 +493,7 @@ if HAS_LINE:
             msg = {
                 "no_key": "🔑 ยังไม่ได้ตั้งค่า GEMINI_API_KEY บน Render",
                 "no_image": "❌ อ่านรูปไม่ได้ (ไฟล์หายหรือใหญ่เกินไป) — ส่งรูปใหม่อีกครั้ง",
+                "quota": "🚫 ใช้ AI ครบโควตาฟรีวันนี้แล้ว (จำกัด ~20 ครั้ง/วัน)\nลองใหม่พรุ่งนี้ หรือพิมพ์แคปชันเองได้เลย",
                 "api_error": "❌ AI ยังตอบไม่ได้ชั่วคราว (server ยุ่ง) — รอสักครู่แล้วพิมพ์ 'คิดแคปชั่น' อีกครั้ง",
             }.get(err, "❌ AI ตอบกลับไม่สำเร็จชั่วคราว — ลองพิมพ์ 'คิดแคปชั่น' อีกครั้ง หรือพิมพ์แคปชันเอง")
             _push(msg)
@@ -615,28 +628,55 @@ if HAS_LINE:
             "- ตอบเป็นแคปชันอย่างเดียว ไม่ต้องมีคำบรรยายเสริม ไม่ต้องขึ้นต้นว่า \"แคปชัน:\" ไม่ต้องใส่ขีดคั่นครอบ ไม่ต้องใส่ลิงก์"
         )
         payload = json.dumps({"contents": [{"parts": parts + [{"text": prompt}]}]}, ensure_ascii=False)
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-        import urllib.request
-        # retry 3 ครั้ง — free tier มักคืน 503 เป็นบางครั้ง
+        import urllib.request, urllib.error
+        # โมเดลสำรอง: โควตาฟรีจำกัด ~20 ครั้ง/วัน/โมเดล — ถ้าเต็ม/โหลดหนัก ข้ามไปโมเดลถัดไป
+        chain = [model]
+        for alt in ("gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite",
+                    "gemini-flash-lite-latest", "gemini-3.1-flash-lite"):
+            if alt not in chain:
+                chain.append(alt)
+        last_err, saw_quota = "", False
         j = None
-        last_err = ""
-        for attempt in range(3):
-            try:
-                req = urllib.request.Request(url, data=payload.encode("utf-8"), method="POST")
-                req.add_header("Content-Type", "application/json")
-                with urllib.request.urlopen(req, timeout=40) as r:
-                    j = json.loads(r.read().decode("utf-8"))
+        # จำกัดเวลาทั้งหมด ~75 วิ กัน webhook ค้าง (retry สั้น ๆ 2 ครั้ง/โมเดล)
+        import time
+        deadline = time.time() + 75
+        for mdl in chain:
+            if time.time() > deadline:
                 break
-            except Exception as e:
+            for attempt in range(2):
+                if time.time() > deadline:
+                    break
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent?key={key}"
                 try:
-                    last_err = e.read().decode("utf-8", "replace")[:300]
-                except Exception:
-                    last_err = str(e)[:300]
-                print(f"gemini_caption attempt {attempt + 1} error: {last_err}")
-                import time
-                time.sleep(2 * (attempt + 1))
-        if j is None:
-            return "", "api_error"
+                    req = urllib.request.Request(url, data=payload.encode("utf-8"), method="POST")
+                    req.add_header("Content-Type", "application/json")
+                    with urllib.request.urlopen(req, timeout=25) as r:
+                        j = json.loads(r.read().decode("utf-8"))
+                    last_err = ""
+                    break
+                except urllib.error.HTTPError as e:
+                    try:
+                        last_err = f"{mdl} HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:200]}"
+                    except Exception:
+                        last_err = f"{mdl} HTTP {e.code}"
+                    print(f"gemini_caption {last_err}")
+                    if e.code == 429:
+                        saw_quota = True
+                        break  # โควตาเต็ม -> ข้ามไปโมเดลถัดไปเลย ไม่ retry
+                    if e.code in (400, 403, 404):
+                        break  # โมเดลใช้ไม่ได้ -> ข้าม
+                    time.sleep(1.5)  # 503/5xx -> retry สั้น ๆ
+                except Exception as e:
+                    last_err = f"{mdl} {type(e).__name__}: {str(e)[:150]}"
+                    print(f"gemini_caption {last_err}")
+                    time.sleep(1.5)
+            else:
+                continue
+            if not last_err:
+                break  # สำเร็จ
+        if last_err or not j:
+            print(f"gemini_caption give up: {last_err}")
+            return "", "quota" if saw_quota else "api_error"
         try:
             parts_out = j["candidates"][0]["content"]["parts"]
             txt = next((p.get("text", "").strip() for p in parts_out if p.get("text")), "")
