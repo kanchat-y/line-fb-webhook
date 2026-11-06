@@ -31,19 +31,30 @@ def check(name, cond, detail=""):
 # ---------- stub line_api ----------
 class FakeMsg:
     def __init__(self, text): self.text = text
-sent = {"reply": [], "push": []}
+sent = {"reply": [], "push": [], "raw": []}  # raw = payload ของ _RawMessage (มี quick_reply)
+
+def _mtext(msg):
+    """ดึงข้อความจาก TextMessage หรือ _RawMessage"""
+    if hasattr(msg, "text"):
+        return msg.text
+    try:
+        d = msg.as_json_dict()
+        sent["raw"].append(d)
+        return d.get("text", str(d))
+    except Exception:
+        return str(msg)
 
 def fake_reply(reply_token, msg, **kw):
     if not reply_token:
         raise Exception("reply token empty")
     if reply_token in [r[0] for r in sent["reply"]]:
         raise Exception(f"reply token reused: {reply_token}")  # LINE จริงจะปฏิเสธ
-    sent["reply"].append((reply_token, msg.text if hasattr(msg, "text") else str(msg)))
+    sent["reply"].append((reply_token, _mtext(msg)))
 
 def fake_push(to, msg, **kw):
     if not to:
         raise Exception("push to empty")
-    sent["push"].append((to, msg.text if hasattr(msg, "text") else str(msg)))
+    sent["push"].append((to, _mtext(msg)))
 
 line_api.reply_message = fake_reply
 line_api.push_message = fake_push
@@ -85,11 +96,47 @@ check("ข้อความแรกเป็น ⏳", sent["reply"] and "⏳" 
 check("push ส่งผลลัพธ์ 1 ครั้ง", len(sent["push"]) == 1, f"push={len(sent['push'])}")
 check("push ถึง user ถูก", sent["push"] and sent["push"][0][0] == uid, str(sent["push"][:1]))
 
+# 2b) เป็น "พรีวิว" ก่อนใช้: ยังไม่ใส่ draft + มีปุ่ม Quick Reply
+check("push เป็นข้อความพรีวิว", "พรีวิว" in sent["push"][0][1], sent["push"][0][1][:120])
+check("ยังไม่ใส่ draft (ต้องกดใช้ก่อน)", not (appmod.pending_posts[uid].get("text") or "").strip(),
+      repr(appmod.pending_posts[uid].get("text")))
+check("เก็บแคปชันรอเลือกใช้", appmod.pending_captions.get(uid) == FAKE_CAPTION, str(appmod.pending_captions.get(uid))[:60])
+qr = next((r.get("quickReply") for r in sent["raw"] if r.get("quickReply")), None)
+labels = [i.get("action", {}).get("label", "") for i in (qr.get("items") if qr else [])]
+check("มีปุ่ม Quick Reply 3 ปุ่ม", len(labels) == 3, str(labels))
+check("มีปุ่ม 'ใช้แคปชันนี้'", any("ใช้แคปชันนี้" in l for l in labels), str(labels))
+check("มีปุ่ม 'คิดใหม่'", any("คิดใหม่" in l for l in labels), str(labels))
+check("มีปุ่ม 'ไม่ใช้'", any("ไม่ใช้" in l for l in labels), str(labels))
+check("บอกวิธีคัดลอกไปแก้เอง", "คัดลอก" in sent["push"][0][1], sent["push"][0][1][-160:])
+
+# 2c) พิมพ์ "ใช้แคปชันนี้" (เหมือนแตะปุ่ม) -> ค่อยใส่ draft + แนบลิงก์ Maps
+class TxEvt:
+    def __init__(self, t, tok):
+        self.reply_token = tok
+        self.message = types.SimpleNamespace(text=t)
+        self.source = types.SimpleNamespace(user_id=uid)
+
+sent["reply"].clear(); sent["raw"].clear()
+appmod.handle_text(TxEvt("ใช้แคปชันนี้", "tok_2c"))
 final_text = appmod.pending_posts[uid]["text"]
-check("แคปชันอยู่ใน draft", FAKE_CAPTION.splitlines()[0] in final_text, final_text[:80])
+check("กดใช้ -> แคปชันเข้า draft", FAKE_CAPTION.splitlines()[0] in final_text, final_text[:80])
+check("กดใช้ -> ล้างแคปชันค้าง", uid not in appmod.pending_captions, str(appmod.pending_captions.get(uid))[:40])
+check("กดใช้ -> ตอบ 1 ครั้ง", len(sent["reply"]) == 1, str(sent["reply"]))
 check("มีลิงก์ Maps ท้ายแคปชัน", "google.com/maps?q=7.006538,100.496597" in final_text, final_text)
 check("ลิงก์อยู่ท้ายจริง (หลังแฮชแท็ก)", final_text.strip().endswith("100.496597"), final_text[-120:])
 check("ไม่ส่ง location เป็นแชร์ (text ล้วน ไม่มี place)", "place" not in final_text.lower() or True)
+
+# 2d) กดโพสต์ทั้งที่ยังไม่เลือกใช้ -> ต้องถูกเตือน (ไม่โพสต์รูปเปล่า)
+sent["reply"].clear(); sent["raw"].clear()
+appmod.pending_captions[uid] = FAKE_CAPTION
+appmod.pending_posts[uid]["text"] = ""
+appmod.handle_text(TxEvt("โพสต์", "tok_2d"))
+check("ยังไม่เลือกใช้ -> เตือนแทนโพสต์", len(sent["reply"]) == 1 and "รอเลือก" in sent["reply"][0][1], str(sent["reply"]))
+appmod.handle_text(TxEvt("ใช่", "tok_2d2"))
+check("ยังไม่เลือกใช้ (พิมพ์ใช่) -> เตือน", len(sent["reply"]) == 2 and "รอเลือก" in sent["reply"][-1][1], str(sent["reply"])[-1:])
+# คืนค่า draft ตามเดิม
+appmod.pending_captions.pop(uid, None)
+appmod.pending_posts[uid]["text"] = final_text
 
 # 3) push ซ้ำ (webhook retry) -> ต้องไม่ทำงานซ้ำ
 sent["push"].clear(); sent["reply"].clear()
@@ -129,6 +176,11 @@ check("มี fallback หลายโมเดล (กันโควตา/503
 check("มี retry ต่อโมเดล", "for attempt in range(2)" in full_src)
 check("แยกเคสโควตาเต็ม", '"quota"' in full_src and "ครบโควตาฟรีวันนี้" in full_src)
 check("ใช้ push_message ส่งผลลัพธ์", "line_api.push_message(uid, TextMessage" in full_src)
+check("พรีวิปก่อนใช้ (เก็บ pending_captions ไม่ใส่ draft)", "pending_captions[uid] = caption" in full_src)
+check("มีปุ่ม Quick Reply ใช้/คิดใหม่/ไม่ใช้", "_caption_preview_message" in full_src and "ใช้แคปชันนี้" in full_src)
+check("มีคำสั่งคิดใหม่/ไม่ใช้แคปชัน", '"คิดใหม่"' in full_src and '"ไม่ใช้แคปชัน"' in full_src)
+check("ข้อความหลังโพสต์ = 'พิกัด'", "พิกัดในแคปชันแล้ว" in full_src and "แนบโลเคชั่นในแคปชันแล้ว" not in full_src)
+check("เรียงโมเดลฟรี lite ก่อน", "gemini-3.5-flash-lite" in full_src and "free tier" in full_src)
 
 # 7) route /ping ยังทำงาน
 c = app.test_client()

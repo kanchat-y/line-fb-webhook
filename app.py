@@ -342,6 +342,7 @@ if HAS_LINE:
     pending_posts = {}   # user_id -> {text, images:[...], videos:[...], image_url(รูปแรก), schedule, ...}
     user_location = {}   # user_id -> {lat, lng, src} (พิกัดที่จะแนบลงแคปชัน อยู่จนกว่าผู้ใช้สั่งปิด)
     ai_caption_busy = set()  # user_id ที่กำลังให้ AI เขียนแคปชันอยู่ (กัน webhook retry ทำงานซ้ำ)
+    pending_captions = {}  # user_id -> แคปชันที่ AI เพิ่งเขียน (พรีวิวก่อนใช้ ยังไม่ใส่ draft จนผู้ใช้เลือก)
 
     def _imgs(p):
         return p.get("images") or ([p["image_url"]] if p.get("image_url") else [])
@@ -389,12 +390,30 @@ if HAS_LINE:
 
     def _page_choice_message(text="📌 จะโพสต์ลงเพจไหน?\n1. ก๊อดเองแม่ตั้งให้\n2. GETUP DEAL\n\nกดเลือกที่เมนูได้เลย"):
         """ข้อความถามเพจแบบเดียวทุกจุด: แตะปุ่ม / แตะหน้าเมนู / พิมพ์ 1-2 (เข้าที่เดียวกัน)"""
-        from linebot.v3.messaging import TextMessage as V3Text, QuickReply as V3QR, QuickReplyItem as V3Item, MessageAction as V3Act
-        payload = V3Text(text=text, quick_reply=V3QR(items=[
-            V3Item(action=V3Act(label="ก๊อดเองแม่ตั้งให้", text="1")),
-            V3Item(action=V3Act(label="GETUP DEAL", text="2")),
-        ])).to_dict()
-        return _RawMessage(payload)
+        def _btn(label, t):
+            return {"type": "action", "action": {"type": "message", "label": label, "text": t}}
+        return _RawMessage({
+            "type": "text",
+            "text": text,
+            "quickReply": {"items": [
+                _btn("ก๊อดเองแม่ตั้งให้", "1"),
+                _btn("GETUP DEAL", "2"),
+            ]},
+        })
+
+    def _caption_preview_message(text):
+        """ข้อความพรีวิวแคปชันจาก AI + ปุ่มเลือก (ใช้ / คิดใหม่ / ไม่ใช้) — สร้าง payload เอง กันพึ่ง SDK v3"""
+        def _btn(label, t):
+            return {"type": "action", "action": {"type": "message", "label": label, "text": t}}
+        return _RawMessage({
+            "type": "text",
+            "text": text,
+            "quickReply": {"items": [
+                _btn("✅ ใช้แคปชันนี้", "ใช้แคปชันนี้"),
+                _btn("🔄 คิดใหม่", "คิดใหม่"),
+                _btn("📝 ไม่ใช้", "ไม่ใช้แคปชัน"),
+            ]},
+        })
 
     def _loc_note(uid):
         """บรรทัดบอกว่ามีโลเคชั่นจะถูกแนบ (ใช้เติมท้าย preview)"""
@@ -484,7 +503,7 @@ if HAS_LINE:
     def _do_ai_caption_work(uid, imgs, hint, p):
         def _push(msg):
             try:
-                line_api.push_message(uid, TextMessage(text=msg))
+                line_api.push_message(uid, TextMessage(text=msg) if isinstance(msg, str) else msg)
             except Exception as e:
                 print(f"ai_caption push error: {e}")
 
@@ -503,14 +522,18 @@ if HAS_LINE:
         for fp in pending_images.pop(uid, []):
             if fp not in p.setdefault("images", []):
                 p["images"].append(fp)
-        # แนบลิงก์ Maps ต่อท้ายแคปชันทันที ถ้าผู้ใช้ตั้งโลเคชั่นไว้ (ตอนโพสต์ apply_location จะไม่แนบซ้ำ)
-        p["text"] = apply_location(caption, user_location.get(uid))
         _sync_first(p)
-        preview = p["text"][:600]
-        _push(
-            f"✨ AI เขียนแคปชันจากภาพให้แล้ว ({len(imgs[:4])} รูป):\n---\n{preview}\n---\n"
-            f"{_media_note(p)} | ⚡ โพสต์ทันที{_loc_note(uid)}\n\n"
-            f"✅ กด 'โพสต์' จากเมนูเพื่อโพสต์เลย หรือพิมพ์ข้อความใหม่เพื่อแก้")
+        # เก็บเป็น "พรีวิว" ก่อน — ยังไม่ใส่ draft จนกว่าผู้ใช้จะกด 'ใช้แคปชันนี้' หรือคัดลอกไปแก้เอง
+        pending_captions[uid] = caption
+        preview = caption[:600]
+        _push(_caption_preview_message(
+            f"✨ AI เขียนแคปชันให้แล้ว — พรีวิวก่อนใช้ ({len(imgs[:4])} รูป):\n"
+            f"---\n{preview}\n---\n"
+            f"{_media_note(p)}{_loc_note(uid)}\n\n"
+            f"เลือกได้เลย:\n"
+            f"• ✅ กด 'ใช้แคปชันนี้' = ใส่เป็นแคปชันโพสต์ (แนบลิงก์แผนที่ให้ถ้ามีโลเคชั่น)\n"
+            f"• ✏️ คัดลอกไปแก้เอง = แตะค้างที่ข้อความด้านบนเพื่อคัดลอก แล้ววางแก้เป็นฉบับของคุณ แล้วส่งเข้ามาเป็นข้อความ\n"
+            f"• 🔄 กด 'คิดใหม่' = ให้ AI เขียนใหม่อีกรอบ"))
 
     def gemini_expand(short_text):
         """ใช้ Gemini ฟรีขยายไอเดียสั้นๆ เป็นแคปชันยาว 5-7 บรรทัด"""
@@ -629,10 +652,11 @@ if HAS_LINE:
         )
         payload = json.dumps({"contents": [{"parts": parts + [{"text": prompt}]}]}, ensure_ascii=False)
         import urllib.request, urllib.error
-        # โมเดลสำรอง: โควตาฟรีจำกัด ~20 ครั้ง/วัน/โมเดล — ถ้าเต็ม/โหลดหนัก ข้ามไปโมเดลถัดไป
+        # โมเดลสำรอง: ใช้เฉพาะ free tier ของ Gemini ทั้งหมด (โควตา ~20 ครั้ง/วัน/โมเดล)
+        # ถ้าเต็ม/โหลดหนัก -> ข้ามไปโมเดลถัดไป โดยลองตัว lite (ฟรี มีโควตา มักเร็ว) ก่อน
         chain = [model]
-        for alt in ("gemini-3.6-flash", "gemini-flash-latest", "gemini-3.5-flash-lite",
-                    "gemini-flash-lite-latest", "gemini-3.1-flash-lite"):
+        for alt in ("gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.1-flash-lite",
+                    "gemini-3.6-flash", "gemini-flash-latest"):
             if alt not in chain:
                 chain.append(alt)
         last_err, saw_quota = "", False
@@ -991,6 +1015,13 @@ if HAS_LINE:
             if not p or (not p.get("text") and not _imgs(p) and not _vids(p)):
                 line_api.reply_message(event.reply_token, TextMessage(text="📭 ยังไม่มี draft ให้โพสต์\nส่งรูป/วิดีโอ + ข้อความมาก่อน แล้วกด 'โพสต์' อีกครั้ง"))
                 return
+            if uid in pending_captions and not (p.get("text") or "").strip():
+                line_api.reply_message(event.reply_token, TextMessage(
+                    text="📝 ยังมีแคปชันของ AI รอเลือกอยู่\n\n"
+                         "• พิมพ์ 'ใช้แคปชันนี้' = เอาไปโพสต์เลย\n"
+                         "• หรือแตะค้างที่ข้อความพรีวิวเพื่อคัดลอก แล้วแก้เป็นของตัวเอง\n"
+                         "• หรือพิมพ์ 'ไม่ใช้แคปชัน' ถ้าจะโพสต์รูปอย่างเดียว"))
+                return
             if FORCE_PAGE_ID:
                 p["page_id"] = FORCE_PAGE_ID
                 p["page_id_selected"] = True
@@ -1007,7 +1038,7 @@ if HAS_LINE:
             pg_name = PAGES.get(pending.get("page_id"), {}).get("name", pending.get("page_id", ""))
             if "success" in result:
                 pid = result["response"].get("id") or result["response"].get("post_id") or ""
-                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}" + ("\n📍 แนบโลเคชั่นในแคปชันแล้ว" if _ploc else "")
+                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}" + ("\n📍 พิกัดในแคปชันแล้ว" if _ploc else "")
             else:
                 reply = f"❌ โพสต์ไม่สำเร็จ ({pg_name}): {result.get('error','')[:300]}"
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
@@ -1039,6 +1070,43 @@ if HAS_LINE:
             _do_ai_caption(uid, event)
             return
 
+        # === เลือกใช้/คิดใหม่/ไม่ใช้ แคปชันจากพรีวิวของ AI (ปุ่ม Quick Reply) ===
+        if _low in ["ใช้แคปชันนี้", "ใช้แคปชั่นนี้", "ใช้แคปชัน", "ใช้แคปชั่น",
+                    "เอาแคปชันนี้", "เอาแคปชั่นนี้", "ใช้เลย", "เอาเลย"]:
+            cap = pending_captions.pop(uid, None)
+            if not cap:
+                line_api.reply_message(event.reply_token, TextMessage(
+                    text="ℹ️ ไม่มีแคปชันของ AI รอเลือกอยู่\nพิมพ์ 'คิดแคปชั่น' เพื่อให้ AI เขียนจากภาพให้ใหม่"))
+                return
+            p = pending_posts.get(uid)
+            if p is None:
+                p = pending_posts[uid] = {"text": "", "images": [], "videos": [], "image_url": None, "schedule": None}
+            for fp in pending_images.pop(uid, []):
+                if fp not in p.setdefault("images", []):
+                    p["images"].append(fp)
+            # ตอนนี้ค่อยแนบลิงก์ Maps (ถ้ามีโลเคชั่น) — apply_location แนบซ้ำไม่ได้อยู่แล้ว
+            p["text"] = apply_location(cap, user_location.get(uid))
+            _sync_first(p)
+            preview = p["text"][:600]
+            sched = f"⏰ ตั้งเวลา {p['schedule'].strftime('%d/%m %H:%M')}" if p.get("schedule") else "⚡ โพสต์ทันที"
+            line_api.reply_message(event.reply_token, TextMessage(
+                text=f"✅ ใช้แคปชันนี้แล้ว:\n---\n{preview}\n---\n"
+                     f"{_media_note(p)} | {sched}{_loc_note(uid)}\n\n"
+                     f"กด 'โพสต์' จากเมนูเพื่อยืนยันโพสต์ หรือพิมพ์ข้อความใหม่เพื่อแก้ไข"))
+            return
+        if _low in ["คิดใหม่", "คิดใหม่อีก", "คิดใหม่หน่อย", "คิดใหม่ให้หน่อย",
+                    "เขียนใหม่", "เขียนใหม่อีก", "ลองใหม่", "เขียนอีก"]:
+            _do_ai_caption(uid, event)
+            return
+        if _low in ["ไม่ใช้แคปชัน", "ไม่ใช้แคปชั่น", "ไม่เอาแคปชัน", "ไม่เอาแคปชั่น", "ยกเลิกแคปชัน", "ยกเลิกแคปชั่น"]:
+            if pending_captions.pop(uid, None) is not None:
+                line_api.reply_message(event.reply_token, TextMessage(
+                    text="🗑️ ไม่ใช้แคปชันของ AI แล้ว\nพิมพ์ 'คิดแคปชั่น' เมื่ออยากให้เขียนใหม่"))
+            else:
+                line_api.reply_message(event.reply_token, TextMessage(
+                    text="ℹ️ ไม่มีแคปชันของ AI รอเลือกอยู่"))
+            return
+
         # 0. เลือกเพจ (ถ้ารอเลือกเพจอยู่) - บังคับทุกครั้งก่อนโพสต์
         if uid in pending_posts and pending_posts[uid].get("awaiting_page"):
             choice = text.strip().lower()
@@ -1064,7 +1132,7 @@ if HAS_LINE:
                 pg_name = PAGES.get(pending.get("page_id"), {}).get("name", pending.get("page_id", ""))
                 if "success" in result:
                     pid = result["response"].get("id") or result["response"].get("post_id") or ""
-                    reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}" + ("\n📍 แนบโลเคชั่นในแคปชันแล้ว" if _ploc else "")
+                    reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}" + ("\n📍 พิกัดในแคปชันแล้ว" if _ploc else "")
                 else:
                     reply = f"❌ โพสต์ไม่สำเร็จ ({pg_name}): {result.get('error','')[:300]}"
                 line_api.reply_message(event.reply_token, TextMessage(text=reply))
@@ -1081,6 +1149,13 @@ if HAS_LINE:
 
         # 1. ถ้าพิมพ์ "ใช่" / "ยืนยัน" / "โพสต์เลย" -> ต้องเลือกเพจก่อนโพสต์เสมอ (ถ้า FORCE_PAGE_ID จะโพสต์เลยไม่ถาม)
         if text in ["ใช่", "ใช่ครับ", "ยืนยัน", "โพสต์เลย", "ตกลง"] and uid in pending_posts:
+            if uid in pending_captions and not (pending_posts[uid].get("text") or "").strip():
+                line_api.reply_message(event.reply_token, TextMessage(
+                    text="📝 ยังมีแคปชันของ AI รอเลือกอยู่\n\n"
+                         "• พิมพ์ 'ใช้แคปชันนี้' = เอาไปโพสต์เลย\n"
+                         "• หรือแตะค้างที่ข้อความพรีวิวเพื่อคัดลอก แล้วแก้เป็นของตัวเอง\n"
+                         "• หรือพิมพ์ 'ไม่ใช้แคปชัน' ถ้าจะโพสต์รูปอย่างเดียว"))
+                return
             if FORCE_PAGE_ID:
                 pending_posts[uid]["page_id"] = FORCE_PAGE_ID
                 pending_posts[uid]["page_id_selected"] = True
@@ -1100,7 +1175,7 @@ if HAS_LINE:
             pg_name = PAGES.get(pending.get("page_id"), {}).get("name", pending.get("page_id", "ก๊อดเองแม่ตั้งให้"))
             if "success" in result:
                 pid = result["response"].get("id") or result["response"].get("post_id") or ""
-                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}" + ("\n📍 แนบโลเคชั่นในแคปชันแล้ว" if _ploc else "")
+                reply = f"✅ โพสต์สำเร็จ!\nhttps://facebook.com/{pid}\nเพจ: {pg_name}" + ("\n📍 พิกัดในแคปชันแล้ว" if _ploc else "")
             else:
                 reply = f"❌ โพสต์ไม่สำเร็จ ({pg_name}): {result.get('error','')[:300]}"
             line_api.reply_message(event.reply_token, TextMessage(text=reply))
