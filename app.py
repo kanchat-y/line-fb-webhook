@@ -126,7 +126,7 @@ def apply_location(text, loc):
     """ต่อท้ายลิงก์โลเคชั่นให้แคปชัน (คืนข้อความเดิมถ้าไม่มี loc หรือมีลิงก์แล้ว)"""
     if not loc or not valid_coords(loc.get("lat"), loc.get("lng")):
         return text if text is not None else ""
-    label = os.environ.get("LOCATION_LABEL", "📍 ตำแหน่งปัจจุบัน").strip() or "📍 ตำแหน่งปัจจุบัน"
+    label = os.environ.get("LOCATION_LABEL", "📍 พิกัด").strip() or "📍 พิกัด"
     url = maps_url(loc['lat'], loc['lng'])
     base = (text or "").strip()
     if url in base:
@@ -942,13 +942,21 @@ if HAS_LINE:
 
         # === Rich Menu คำสั่งลัด 6 ปุ่ม (ต้องอยู่ก่อน logic อื่น) ===
         if text in ["✨ ต้องการโพสต์", "ต้องการโพสต์", "เริ่มต้นระบบ"]:
+            guide = ("📖 การใช้งานระบบโพสต์\n"
+                     "1. เลือกรูป/วิดีโอ\n"
+                     "2. ส่งพิกัด\n"
+                     "3. เขียนแคปชั่น\n"
+                     "4. โพสต์")
             p = pending_posts.get(uid)
             if p and (p.get("text") or _imgs(p) or _vids(p)):
                 preview = (p.get("text") or "(มีแต่รูป/วิดีโอ)")[:300]
                 img_note = _media_note(p)
-                line_api.reply_message(event.reply_token, TextMessage(text=f"📋 Draft ปัจจุบัน:\n---\n{preview}\n---\n{img_note}{_loc_note(uid)}\n\nกด 'โพสต์' เพื่อโพสต์ หรือ 'ยกเลิกโพสต์' เพื่อล้าง"))
+                line_api.reply_message(event.reply_token, TextMessage(
+                    text=f"{guide}\n\n📋 Draft ปัจจุบัน:\n---\n{preview}\n---\n{img_note}{_loc_note(uid)}\n\n"
+                         f"กด 'โพสต์' เพื่อโพสต์ หรือ 'ยกเลิกโพสต์' เพื่อล้าง"))
             else:
-                line_api.reply_message(event.reply_token, TextMessage(text="🚀 เริ่มต้นระบบ — ส่งรูป/วิดีโอ + ข้อความมาได้เลย แล้วกด 'โพสต์'"))
+                line_api.reply_message(event.reply_token, TextMessage(
+                    text=f"{guide}\n\n🚀 เริ่มได้เลย — ส่งรูป/วิดีโอ + ข้อความมาได้เลย แล้วกด 'โพสต์'"))
             return
 
         if text in ["แก้ไขรูป", "แก้รูป"]:

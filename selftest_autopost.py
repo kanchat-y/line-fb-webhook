@@ -182,6 +182,18 @@ check("มีคำสั่งคิดใหม่/ไม่ใช้แคป
 check("ข้อความหลังโพสต์ = 'พิกัด'", "พิกัดในแคปชันแล้ว" in full_src and "แนบโลเคชั่นในแคปชันแล้ว" not in full_src)
 check("เรียงโมเดลฟรี lite ก่อน", "gemini-3.5-flash-lite" in full_src and "free tier" in full_src)
 
+# 6.5) คู่มือปุ่ม "เริ่มต้นระบบ" + ป้ายลิงก์เป็น "พิกัด"
+sent["reply"].clear(); sent["raw"].clear()
+appmod.handle_text(TxEvt("เริ่มต้นระบบ", "tok_guide"))
+g = sent["reply"][0][1]
+check("เริ่มต้นระบบ -> ตอบคู่มือ", "การใช้งานระบบโพสต์" in g, g[:80])
+for _step in ("1. เลือกรูป/วิดีโอ", "2. ส่งพิกัด", "3. เขียนแคปชั่น", "4. โพสต์"):
+    check(f"คู่มือมี '{_step}'", _step in g, g)
+check("คู่มือแสดงพร้อม draft", "Draft ปัจจุบัน" in g, g[-120:])
+_lbl = appmod.apply_location("แคปชันทดสอบ", {"lat": 7.0, "lng": 100.5})
+check("ป้ายลิงก์ = 📍 พิกัด", "📍 พิกัด" in _lbl and _lbl.splitlines()[-2] == "📍 พิกัด", _lbl[:60])
+check("ไม่ใช้คำว่า 'ตำแหน่งปัจจุบัน' ในป้ายลิงก์", "ตำแหน่งปัจจุบัน" not in _lbl, _lbl[:60])
+
 # 7) route /ping ยังทำงาน
 c = app.test_client()
 r = c.get("/ping")
